@@ -164,6 +164,16 @@
         display: block;
       }
 
+      @media (orientation: portrait) and (max-width: 900px) {
+        #webcam-wrapper {
+          width: clamp(104px, 24vw, 128px);
+          height: auto;
+          aspect-ratio: 4 / 3;
+          bottom: 24px;
+          right: 24px;
+        }
+      }
+
       /* 帮助面板 - 左侧 */
       #help-panel {
         position: absolute;
@@ -248,6 +258,30 @@
       }
 
       #settings-btn:hover {
+        background: rgba(212, 175, 55, 0.18);
+        box-shadow: 0 0 18px rgba(212, 175, 55, 0.25);
+      }
+
+      #mode-toggle-btn {
+        margin-top: 10px;
+        width: 38px;
+        height: 28px;
+        background: rgba(20, 20, 20, 0.6);
+        border: 1px solid rgba(212, 175, 55, 0.4);
+        border-radius: 6px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        backdrop-filter: blur(5px);
+        transition: all 0.25s;
+        color: rgba(212, 175, 55, 0.95);
+        font-size: 14px;
+        letter-spacing: 0px;
+        user-select: none;
+      }
+
+      #mode-toggle-btn:hover {
         background: rgba(212, 175, 55, 0.18);
         box-shadow: 0 0 18px rgba(212, 175, 55, 0.25);
       }
@@ -511,6 +545,7 @@
         <button id="settings-btn" aria-label="设置">
           <div class="hamburger"><span></span></div>
         </button>
+        <button id="mode-toggle-btn" aria-label="切换模式">⇄</button>
         <div id="settings-panel" class="hidden">
           <div class="menu-title">设置</div>
           <button id="menu-upload-btn" class="menu-btn">上传照片</button>
@@ -588,6 +623,22 @@
         focusIndex: -1,
         focusTarget: null,
         hand: { detected: false, x: 0, y: 0, landmarks: null, showSkeleton: true, lastSeenMs: 0 },
+        gesture: { lastUpdateMs: 0, lastSwitchMs: 0, fistMs: 0, pinchMs: 0, openMs: 0 },
+        drag: {
+          active: false,
+          pointerId: null,
+          lastSeenMs: 0,
+          lastMoveMs: 0,
+          startX: 0,
+          startY: 0,
+          lastX: 0,
+          lastY: 0,
+          moved: false,
+          vx: 0,
+          vy: 0,
+          tapActive: false,
+          tapPhoto: null,
+        },
         rotation: { x: 0, y: 0 },
         uiHidden: false,
       }
@@ -597,12 +648,47 @@
       let clock = new THREE.Clock()
       let particleSystem = []
       let photoMeshGroup = new THREE.Group()
+      let modeToggleBtn
       let handLandmarker, video, webcamCanvas, webcamCtx
       let caneTexture, snowflakeTexture
       let snowflakeSystem
       let ribbonSystem
       let starRig
       let occluder
+      const _photoRaycaster = new THREE.Raycaster()
+      const _photoNdc = new THREE.Vector2()
+
+      function updateModeToggleBtn() {
+        if (!modeToggleBtn) return
+        modeToggleBtn.textContent = '⇄'
+      }
+
+      function pickPhotoGroupAt(clientX, clientY) {
+        if (!renderer || !camera || !photoMeshGroup) return null
+        if (!photoMeshGroup.children.length) return null
+
+        const rect = renderer.domElement.getBoundingClientRect()
+        const x = ((clientX - rect.left) / rect.width) * 2 - 1
+        const y = -(((clientY - rect.top) / rect.height) * 2 - 1)
+        _photoNdc.set(x, y)
+        _photoRaycaster.setFromCamera(_photoNdc, camera)
+
+        const hits = _photoRaycaster.intersectObjects(photoMeshGroup.children, true)
+        if (!hits.length) return null
+
+        let obj = hits[0].object
+        while (obj && obj.parent && obj.parent !== photoMeshGroup) obj = obj.parent
+        if (obj && obj.parent === photoMeshGroup) return obj
+        return null
+      }
+
+      function setMode(nextMode) {
+        if (STATE.mode === nextMode) return
+        STATE.mode = nextMode
+        if (STATE.gesture) STATE.gesture.lastSwitchMs = performance.now()
+        if (nextMode !== 'FOCUS') STATE.focusTarget = null
+        updateModeToggleBtn()
+      }
 
       async function init() {
         initThree()
@@ -648,6 +734,7 @@
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
         renderer.toneMapping = THREE.ReinhardToneMapping
         renderer.toneMappingExposure = 2.2
+        renderer.domElement.style.touchAction = 'none'
         container.appendChild(renderer.domElement)
 
         mainGroup = new THREE.Group()
@@ -689,7 +776,7 @@
           0.4,
           0.85
         )
-        bloomPass.threshold = 0.7
+        bloomPass.threshold = 1.05
         bloomPass.strength = 0.45
         bloomPass.radius = 0.4
 
@@ -1424,8 +1511,8 @@
         ctx.font = '500 60px Times New Roman'
         ctx.fillStyle = '#eebb66'
         ctx.textAlign = 'center'
-        ctx.fillText('By', 256, 230)
-        ctx.fillText('Youhun', 256, 300)
+        ctx.fillText('To', 256, 230)
+        ctx.fillText('GN~', 256, 300)
 
         const tex = new THREE.CanvasTexture(canvas)
         tex.colorSpace = THREE.SRGBColorSpace
@@ -1433,14 +1520,6 @@
       }
 
       function addPhotoToScene(texture) {
-        const frameGeo = new THREE.BoxGeometry(1.4, 1.4, 0.05)
-        const frameMat = new THREE.MeshStandardMaterial({
-          color: CONFIG.colors.champagneGold,
-          metalness: 1.0,
-          roughness: 0.1,
-        })
-        const frame = new THREE.Mesh(frameGeo, frameMat)
-
         const img = texture?.image ?? texture?.source?.data
         const iw = img?.naturalWidth ?? img?.videoWidth ?? img?.width ?? 0
         const ih = img?.naturalHeight ?? img?.videoHeight ?? img?.height ?? 0
@@ -1449,10 +1528,24 @@
         const maxSide = 1.18
         const photoW = aspect >= 1 ? maxSide : maxSide * aspect
         const photoH = aspect >= 1 ? maxSide / aspect : maxSide
+
+        const border = 0.11
+        const frameDepth = 0.06
+        const frameGeo = new THREE.BoxGeometry(photoW + border * 2, photoH + border * 2, frameDepth)
+        const frameMat = new THREE.MeshStandardMaterial({
+          color: 0xf7f6f2,
+          metalness: 0.0,
+          roughness: 1.0,
+          envMapIntensity: 0.12,
+        })
+        frameMat.toneMapped = false
+        const frame = new THREE.Mesh(frameGeo, frameMat)
+
         const photoGeo = new THREE.PlaneGeometry(photoW, photoH)
-        const photoMat = new THREE.MeshBasicMaterial({ map: texture })
+        const photoMat = new THREE.MeshBasicMaterial({ map: texture, color: 0xe2e2e2 })
+        photoMat.toneMapped = false
         const photo = new THREE.Mesh(photoGeo, photoMat)
-        photo.position.z = 0.04
+        photo.position.z = frameDepth / 2 + 0.002
 
         const group = new THREE.Group()
         group.add(frame)
@@ -1541,9 +1634,30 @@
 
         // Draw video frame to canvas
         if (video.readyState === video.HAVE_ENOUGH_DATA) {
-          webcamCtx.drawImage(video, 0, 0, webcamCanvas.width, webcamCanvas.height)
+          const cw = webcamCanvas.width
+          const ch = webcamCanvas.height
+          const vw = video.videoWidth || 0
+          const vh = video.videoHeight || 0
+
+          webcamCtx.setTransform(1, 0, 0, 1, 0, 0)
+          webcamCtx.fillStyle = 'rgba(0, 0, 0, 1)'
+          webcamCtx.fillRect(0, 0, cw, ch)
+
+          let previewTransform = null
+          if (vw > 0 && vh > 0) {
+            const scale = Math.min(cw / vw, ch / vh)
+            const drawW = vw * scale
+            const drawH = vh * scale
+            const dx = (cw - drawW) / 2
+            const dy = (ch - drawH) / 2
+            previewTransform = { dx, dy, scale, vw, vh }
+            webcamCtx.drawImage(video, dx, dy, drawW, drawH)
+          } else {
+            webcamCtx.drawImage(video, 0, 0, cw, ch)
+          }
+
           if (STATE.hand.showSkeleton && STATE.hand.landmarks) {
-            drawHandSkeleton(webcamCtx, webcamCanvas, STATE.hand.landmarks)
+            drawHandSkeleton(webcamCtx, webcamCanvas, STATE.hand.landmarks, previewTransform)
           }
         }
 
@@ -1577,9 +1691,17 @@
         [17, 5],
       ]
 
-      function drawHandSkeleton(ctx, canvas, landmarks) {
+      function drawHandSkeleton(ctx, canvas, landmarks, transform) {
         const w = canvas.width
         const h = canvas.height
+        const vw = transform?.vw ?? w
+        const vh = transform?.vh ?? h
+        const scale = transform?.scale ?? 1
+        const dx = transform?.dx ?? 0
+        const dy = transform?.dy ?? 0
+
+        const mapX = (nx) => dx + nx * vw * scale
+        const mapY = (ny) => dy + ny * vh * scale
 
         ctx.save()
         ctx.lineCap = 'round'
@@ -1592,8 +1714,8 @@
           const lb = landmarks[b]
           if (!la || !lb) continue
           ctx.beginPath()
-          ctx.moveTo(la.x * w, la.y * h)
-          ctx.lineTo(lb.x * w, lb.y * h)
+          ctx.moveTo(mapX(la.x), mapY(la.y))
+          ctx.lineTo(mapX(lb.x), mapY(lb.y))
           ctx.stroke()
         }
 
@@ -1601,8 +1723,8 @@
         for (let i = 0; i < landmarks.length; i++) {
           const lm = landmarks[i]
           if (!lm) continue
-          const x = lm.x * w
-          const y = lm.y * h
+          const x = mapX(lm.x)
+          const y = mapY(lm.y)
           ctx.beginPath()
           ctx.arc(x, y, i === 0 ? 2.4 : 1.9, 0, Math.PI * 2)
           ctx.fill()
@@ -1628,7 +1750,7 @@
           cx /= palmIds.length
           cy /= palmIds.length
 
-          const rawX = (cx - 0.5) * 2
+          const rawX = (0.5 - cx) * 2
           const rawY = (cy - 0.5) * 2
           const smooth = 0.22
           STATE.hand.x += (rawX - STATE.hand.x) * smooth
@@ -1658,24 +1780,33 @@
           )
           avgDist /= 4
 
-          // 修改逻辑：优先检查握拳（更严格），避免与捏夹冲突
-          if (fistDistance < 0.18) {
-            // 握拳：手指都靠近手掌中心
-            STATE.mode = 'TREE'
-            STATE.focusTarget = null
-          } else if (pinchDist < 0.045 && avgDist > 0.28) {
-            // 捏夹：大拇指和食指靠很近，且不是握拳状态
+          const now = performance.now()
+          const g = STATE.gesture
+          const dtMs = g.lastUpdateMs ? Math.min(80, now - g.lastUpdateMs) : 16
+          g.lastUpdateMs = now
+
+          const pinchActive = pinchDist < 0.055 && avgDist > 0.22
+          const openActive = avgDist > 0.42
+          const fistActive = fistDistance < 0.155 && avgDist < 0.26 && pinchDist > 0.07
+
+          g.pinchMs = pinchActive ? Math.min(500, g.pinchMs + dtMs) : Math.max(0, g.pinchMs - dtMs * 2.2)
+          g.openMs = openActive ? Math.min(500, g.openMs + dtMs) : Math.max(0, g.openMs - dtMs * 2.0)
+          g.fistMs = fistActive ? Math.min(500, g.fistMs + dtMs) : Math.max(0, g.fistMs - dtMs * 2.4)
+
+          const cooldown = now - g.lastSwitchMs < 260
+
+          if (g.pinchMs > 90) {
             if (STATE.mode !== 'FOCUS') {
-              STATE.mode = 'FOCUS'
+              setMode('FOCUS')
               const photos = particleSystem.filter((p) => p.type === 'PHOTO')
               if (photos.length)
                 STATE.focusTarget =
                   photos[Math.floor(Math.random() * photos.length)].mesh
             }
-          } else if (avgDist > 0.4) {
-            // 张开手势
-            STATE.mode = 'SCATTER'
-            STATE.focusTarget = null
+          } else if (g.openMs > 120) {
+            setMode('SCATTER')
+          } else if (!cooldown && g.fistMs > 180 && g.pinchMs < 30) {
+            setMode('TREE')
           }
         } else {
           STATE.hand.detected = false
@@ -1699,8 +1830,10 @@
         const menuManageBtn = document.getElementById('menu-manage-btn')
         const menuHideUiBtn = document.getElementById('menu-hide-ui-btn')
         const toggleSkeleton = document.getElementById('toggle-skeleton')
+        modeToggleBtn = document.getElementById('mode-toggle-btn')
         const uiLayer = document.getElementById('ui-layer')
         const webcamWrapper = document.getElementById('webcam-wrapper')
+        const photoManager = document.getElementById('photo-manager')
 
         const closeSettings = () => settingsPanel.classList.add('hidden')
         const toggleSettings = () => settingsPanel.classList.toggle('hidden')
@@ -1740,9 +1873,155 @@
           toggleSettings()
         })
 
+        updateModeToggleBtn()
+        if (modeToggleBtn) {
+          modeToggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation()
+            closeSettings()
+            setMode(STATE.mode === 'TREE' ? 'SCATTER' : 'TREE')
+          })
+        }
+
         settingsPanel.addEventListener('click', (e) => e.stopPropagation())
 
         window.addEventListener('click', () => closeSettings())
+
+        const isUiTarget = (el) => {
+          if (!(el instanceof Element)) return false
+          return (
+            !!el.closest('#ui-layer') ||
+            !!el.closest('#settings-panel') ||
+            !!el.closest('#photo-manager')
+          )
+        }
+
+        const canvas = renderer.domElement
+        canvas.addEventListener(
+          'pointerdown',
+          (e) => {
+            if (STATE.uiHidden) return
+            if (isUiTarget(e.target)) return
+            if (STATE.drag.active || STATE.drag.tapActive) return
+
+            closeSettings()
+            if (photoManager && !photoManager.classList.contains('hidden')) return
+
+            const hitPhoto = STATE.mode === 'SCATTER' ? pickPhotoGroupAt(e.clientX, e.clientY) : null
+            if (hitPhoto) {
+              STATE.drag.tapActive = true
+              STATE.drag.tapPhoto = hitPhoto
+              STATE.drag.pointerId = e.pointerId
+              STATE.drag.startX = e.clientX
+              STATE.drag.startY = e.clientY
+              STATE.drag.lastX = e.clientX
+              STATE.drag.lastY = e.clientY
+              STATE.drag.moved = false
+              STATE.drag.lastMoveMs = performance.now()
+              canvas.setPointerCapture(e.pointerId)
+              e.preventDefault()
+              return
+            }
+
+            STATE.drag.active = true
+            STATE.drag.pointerId = e.pointerId
+            STATE.drag.startX = e.clientX
+            STATE.drag.startY = e.clientY
+            STATE.drag.lastX = e.clientX
+            STATE.drag.lastY = e.clientY
+            STATE.drag.moved = false
+            STATE.drag.lastMoveMs = performance.now()
+            STATE.drag.vx = 0
+            STATE.drag.vy = 0
+            canvas.setPointerCapture(e.pointerId)
+            e.preventDefault()
+          },
+          { passive: false }
+        )
+
+        canvas.addEventListener(
+          'pointermove',
+          (e) => {
+            if (STATE.drag.pointerId !== e.pointerId) return
+            if (!STATE.drag.active && !STATE.drag.tapActive) return
+
+            const now = performance.now()
+            const dt = Math.max(1, now - STATE.drag.lastMoveMs) / 1000
+
+            const dx = e.clientX - STATE.drag.lastX
+            const dy = e.clientY - STATE.drag.lastY
+            STATE.drag.lastX = e.clientX
+            STATE.drag.lastY = e.clientY
+            STATE.drag.lastMoveMs = now
+            STATE.drag.lastSeenMs = now
+            if (!STATE.drag.moved) {
+              const total = Math.abs(e.clientX - STATE.drag.startX) + Math.abs(e.clientY - STATE.drag.startY)
+              if (total > 4) STATE.drag.moved = true
+            }
+
+            if (STATE.drag.tapActive) {
+              if (!STATE.drag.moved) return
+              STATE.drag.tapActive = false
+              STATE.drag.tapPhoto = null
+              STATE.drag.active = true
+              STATE.drag.vx = 0
+              STATE.drag.vy = 0
+              STATE.drag.lastX = e.clientX
+              STATE.drag.lastY = e.clientY
+              STATE.drag.lastMoveMs = now
+              e.preventDefault()
+              return
+            }
+
+            const rotYDelta = dx * 0.006
+            const rotXDelta = dy * 0.004
+
+            STATE.rotation.y += rotYDelta
+            if (STATE.mode !== 'TREE') {
+              STATE.rotation.x += rotXDelta
+              const maxX = Math.PI * 0.45
+              STATE.rotation.x = THREE.MathUtils.clamp(STATE.rotation.x, -maxX, maxX)
+            } else {
+              STATE.rotation.x = 0
+            }
+
+            STATE.drag.vy = rotYDelta / dt
+            STATE.drag.vx = (STATE.mode !== 'TREE' ? rotXDelta : 0) / dt
+
+            e.preventDefault()
+          },
+          { passive: false }
+        )
+
+        const endDrag = (e) => {
+          if (STATE.drag.pointerId !== e.pointerId) return
+          const wasActive = STATE.drag.active
+          const wasTap = STATE.drag.tapActive
+          const moved = STATE.drag.moved
+          const tapPhoto = STATE.drag.tapPhoto
+
+          STATE.drag.active = false
+          STATE.drag.tapActive = false
+          STATE.drag.tapPhoto = null
+          STATE.drag.pointerId = null
+          STATE.drag.lastSeenMs = performance.now()
+          try {
+            canvas.releasePointerCapture(e.pointerId)
+          } catch {}
+
+          const now = performance.now()
+          const handActive = STATE.hand.detected || now - STATE.hand.lastSeenMs < 260
+          if (!moved && !handActive) {
+            if (wasTap && tapPhoto && STATE.mode === 'SCATTER') {
+              setMode('FOCUS')
+              STATE.focusTarget = tapPhoto
+            } else if (wasActive && STATE.mode === 'FOCUS') {
+              setMode('SCATTER')
+            }
+          }
+        }
+
+        canvas.addEventListener('pointerup', endDrag)
+        canvas.addEventListener('pointercancel', endDrag)
 
         window.addEventListener(
           'pointerdown',
@@ -1855,10 +2134,15 @@
         // Rotation Logic
         const nowMs = performance.now()
         const handActive = STATE.hand.detected || nowMs - STATE.hand.lastSeenMs < 260
+        const hasInertia =
+          Math.abs(STATE.drag.vx) + Math.abs(STATE.drag.vy) > 0.0008
+        const dragActive = STATE.drag.active || hasInertia
 
         if (handActive) {
+          STATE.drag.vx = 0
+          STATE.drag.vy = 0
           const rotStrength =
-            STATE.mode === 'FOCUS' ? 0.85 : STATE.mode === 'TREE' ? 1.2 : 1.25
+            STATE.mode === 'FOCUS' ? 1.15 : STATE.mode === 'TREE' ? 1.7 : 1.6
           const hx = THREE.MathUtils.clamp(STATE.hand.x, -1, 1)
           const hy = THREE.MathUtils.clamp(STATE.hand.y, -1, 1)
           const targetRotY = hx * Math.PI * rotStrength
@@ -1866,12 +2150,28 @@
           STATE.rotation.y += (targetRotY - STATE.rotation.y) * 3.0 * dt
           const xFollow = STATE.mode === 'TREE' ? 5.5 : 3.0
           STATE.rotation.x += (targetRotX - STATE.rotation.x) * xFollow * dt
+        } else if (dragActive) {
+          if (!STATE.drag.active) {
+            STATE.rotation.y += STATE.drag.vy * dt
+            STATE.drag.vy *= Math.exp(-7.5 * dt)
+            if (STATE.mode !== 'TREE') {
+              STATE.rotation.x += STATE.drag.vx * dt
+              STATE.drag.vx *= Math.exp(-7.5 * dt)
+              const maxX = Math.PI * 0.45
+              STATE.rotation.x = THREE.MathUtils.clamp(STATE.rotation.x, -maxX, maxX)
+            } else {
+              STATE.rotation.x += (0 - STATE.rotation.x) * 3.0 * dt
+              STATE.drag.vx = 0
+            }
+          } else {
+            if (STATE.mode === 'TREE') STATE.rotation.x = 0
+          }
         } else {
           if (STATE.mode === 'TREE') {
-            STATE.rotation.y += 0.075 * dt
+            STATE.rotation.y += 0.0375 * dt
             STATE.rotation.x += (0 - STATE.rotation.x) * 2.0 * dt
           } else {
-            STATE.rotation.y += 0.025 * dt
+            STATE.rotation.y += 0.0125 * dt
           }
         }
 
