@@ -1294,7 +1294,8 @@
             s = this.baseScale * 2.5
           } else if (mode === 'FOCUS') {
             if (this.mesh === focusTargetMesh) s = 4.5
-            else s = this.baseScale * 0.8
+            else if (this.type === 'PHOTO') s = this.baseScale * 2.5
+            else s = this.baseScale
           }
 
           this.mesh.scale.lerp(new THREE.Vector3(s, s, s), 4 * dt)
@@ -2177,12 +2178,16 @@
         if (handActive) {
           STATE.drag.vx = 0
           STATE.drag.vy = 0
-          const rotStrength =
-            STATE.mode === 'FOCUS' ? 1.6 : STATE.mode === 'TREE' ? 2.6 : 2.4
+          const rotStrength = STATE.mode === 'TREE' ? 2.6 : 2.4
           const hx = THREE.MathUtils.clamp(STATE.hand.x, -1, 1)
           const hy = THREE.MathUtils.clamp(STATE.hand.y, -1, 1)
           const targetRotY = hx * Math.PI * rotStrength
-          const targetRotX = STATE.mode === 'TREE' ? 0 : hy * Math.PI * (0.25 * rotStrength)
+          const targetRotX =
+            STATE.mode === 'TREE'
+              ? 0
+              : STATE.mode === 'SCATTER'
+                ? hy * Math.PI * (0.25 * rotStrength)
+                : STATE.rotation.x
           STATE.rotation.y += (targetRotY - STATE.rotation.y) * 3.0 * dt
           const xFollow = STATE.mode === 'TREE' ? 5.5 : 3.0
           STATE.rotation.x += (targetRotX - STATE.rotation.x) * xFollow * dt
