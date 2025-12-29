@@ -1733,6 +1733,45 @@
         ctx.restore()
       }
 
+      const _pickTmpWorld = new THREE.Vector3()
+      const _pickTmpCam = new THREE.Vector3()
+      const _pickCamPos = new THREE.Vector3()
+
+      function pickFrontmostPhoto() {
+        const photos = particleSystem.filter((p) => p.type === 'PHOTO')
+        if (!photos.length) return null
+
+        camera.updateMatrixWorld(true)
+        if (mainGroup) mainGroup.updateMatrixWorld(true)
+        camera.getWorldPosition(_pickCamPos)
+
+        let bestMesh = null
+        let hasFront = false
+        let bestCamZ = -Infinity
+        let bestDistSq = Infinity
+        for (const p of photos) {
+          const m = p.mesh
+          if (!m) continue
+          m.getWorldPosition(_pickTmpWorld)
+          _pickTmpCam.copy(_pickTmpWorld).applyMatrix4(camera.matrixWorldInverse)
+
+          const camZ = _pickTmpCam.z
+          if (camZ < 0 && camZ > bestCamZ) {
+            bestCamZ = camZ
+            bestMesh = m
+            hasFront = true
+          }
+
+          const d2 = _pickTmpWorld.distanceToSquared(_pickCamPos)
+          if (!hasFront && d2 < bestDistSq) {
+            bestDistSq = d2
+            bestMesh = m
+          }
+        }
+
+        return bestMesh
+      }
+
       function processGestures(result) {
         if (result.landmarks && result.landmarks.length > 0) {
           STATE.hand.detected = true
@@ -1798,10 +1837,7 @@
           if (g.pinchMs > 90) {
             if (STATE.mode !== 'FOCUS') {
               setMode('FOCUS')
-              const photos = particleSystem.filter((p) => p.type === 'PHOTO')
-              if (photos.length)
-                STATE.focusTarget =
-                  photos[Math.floor(Math.random() * photos.length)].mesh
+              STATE.focusTarget = pickFrontmostPhoto()
             }
           } else if (g.openMs > 120) {
             setMode('SCATTER')
@@ -2142,7 +2178,7 @@
           STATE.drag.vx = 0
           STATE.drag.vy = 0
           const rotStrength =
-            STATE.mode === 'FOCUS' ? 1.15 : STATE.mode === 'TREE' ? 1.7 : 1.6
+            STATE.mode === 'FOCUS' ? 1.6 : STATE.mode === 'TREE' ? 2.6 : 2.4
           const hx = THREE.MathUtils.clamp(STATE.hand.x, -1, 1)
           const hy = THREE.MathUtils.clamp(STATE.hand.y, -1, 1)
           const targetRotY = hx * Math.PI * rotStrength
