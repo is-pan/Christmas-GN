@@ -1185,10 +1185,7 @@
 
           // SCATTER: 3D Sphere
           if (this.type === 'PHOTO') {
-            const ringR = 12 + Math.random() * 3
-            const a = Math.random() * Math.PI * 2
-            const yScatter = (Math.random() - 0.5) * h * 0.6 + 1.5
-            this.posScatter.set(Math.cos(a) * ringR, yScatter, Math.sin(a) * ringR)
+            this.posScatter.set(0, 1.5, 14)
             return
           }
 
@@ -1518,6 +1515,47 @@
         const tex = new THREE.CanvasTexture(canvas)
         tex.colorSpace = THREE.SRGBColorSpace
         addPhotoToScene(tex)
+        relayoutScatterPhotos()
+      }
+
+      function relayoutScatterPhotos() {
+        const photos = particleSystem.filter((p) => p.type === 'PHOTO')
+        const n = photos.length
+        if (!n) return
+
+        const centerY = 1.5
+        const baseDist = 14
+        const dist = Math.max(baseDist, 10 + n * 0.45)
+        const levels = Math.min(4, Math.max(2, Math.ceil(n / 10)))
+        const span = Math.min(4.8, dist * 0.33)
+
+        const yLevels = []
+        if (levels === 1) yLevels.push(0)
+        else {
+          for (let i = 0; i < levels; i++) {
+            yLevels.push(((i / (levels - 1)) * 2 - 1) * span)
+          }
+        }
+
+        const buckets = Array.from({ length: levels }, () => [])
+        for (let i = 0; i < n; i++) buckets[i % levels].push(photos[i])
+
+        for (let l = 0; l < levels; l++) {
+          const bucket = buckets[l]
+          const m = bucket.length
+          if (!m) continue
+          const y = yLevels[l] ?? 0
+          const r = Math.sqrt(Math.max(0.01, dist * dist - y * y))
+          const offset = (l / levels) * (Math.PI / 3)
+          for (let j = 0; j < m; j++) {
+            const a = (j / m) * Math.PI * 2 + offset
+            bucket[j].posScatter.set(
+              Math.cos(a) * r,
+              centerY + y,
+              Math.sin(a) * r
+            )
+          }
+        }
       }
 
       function addPhotoToScene(texture) {
@@ -1557,6 +1595,7 @@
 
         photoMeshGroup.add(group)
         particleSystem.push(new Particle(group, 'PHOTO', false))
+        relayoutScatterPhotos()
       }
 
       function handleImageUpload(e) {
@@ -2161,6 +2200,7 @@
           
           // 更新照片网格
           updatePhotoGrid()
+          relayoutScatterPhotos()
         }
       }
 
