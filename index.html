@@ -391,6 +391,28 @@
       .menu-toggle input {
         accent-color: #d4af37;
       }
+
+      .menu-select {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-top: 10px;
+        color: #ccc;
+        font-size: 12px;
+        letter-spacing: 1px;
+        user-select: none;
+      }
+
+      .menu-select select {
+        background: rgba(20, 20, 20, 0.6);
+        border: 1px solid rgba(212, 175, 55, 0.35);
+        color: #d4af37;
+        padding: 6px 8px;
+        border-radius: 6px;
+        font-size: 12px;
+        outline: none;
+      }
       
       #menu-hide-ui-btn {
         margin-top: 14px;
@@ -562,6 +584,14 @@
             <input id="toggle-skeleton" type="checkbox" checked />
             显示骨骼
           </label>
+          <div class="menu-select">
+            <span>手势灵敏度</span>
+            <select id="gesture-sensitivity">
+              <option value="slow">慢</option>
+              <option value="medium" selected>中</option>
+              <option value="fast">快</option>
+            </select>
+          </div>
           <button id="menu-hide-ui-btn" class="menu-btn">隐藏UI</button>
         </div>
       </div>
@@ -622,6 +652,7 @@
         mode: 'TREE',
         focusIndex: -1,
         focusTarget: null,
+        gestureSensitivity: 'medium',
         hand: { detected: false, x: 0, y: 0, landmarks: null, showSkeleton: true, lastSeenMs: 0 },
         gesture: { lastUpdateMs: 0, lastSwitchMs: 0, fistMs: 0, pinchMs: 0, openMs: 0 },
         drag: {
@@ -688,6 +719,13 @@
         if (STATE.gesture) STATE.gesture.lastSwitchMs = performance.now()
         if (nextMode !== 'FOCUS') STATE.focusTarget = null
         updateModeToggleBtn()
+      }
+
+      function getGestureSensitivityConfig() {
+        const v = STATE.gestureSensitivity || 'medium'
+        if (v === 'fast') return { rot: 1.25, follow: 1.15, smooth: 0.3 }
+        if (v === 'slow') return { rot: 0.85, follow: 0.85, smooth: 0.16 }
+        return { rot: 1.0, follow: 1.0, smooth: 0.22 }
       }
 
       async function init() {
@@ -1831,7 +1869,7 @@
 
           const rawX = (0.5 - cx) * 2
           const rawY = (cy - 0.5) * 2
-          const smooth = 0.22
+          const smooth = getGestureSensitivityConfig().smooth
           STATE.hand.x += (rawX - STATE.hand.x) * smooth
           STATE.hand.y += (rawY - STATE.hand.y) * smooth
 
@@ -1906,6 +1944,7 @@
         const menuManageBtn = document.getElementById('menu-manage-btn')
         const menuHideUiBtn = document.getElementById('menu-hide-ui-btn')
         const toggleSkeleton = document.getElementById('toggle-skeleton')
+        const gestureSensitivity = document.getElementById('gesture-sensitivity')
         modeToggleBtn = document.getElementById('mode-toggle-btn')
         const uiLayer = document.getElementById('ui-layer')
         const webcamWrapper = document.getElementById('webcam-wrapper')
@@ -1929,6 +1968,13 @@
         toggleSkeleton.addEventListener('change', () => {
           STATE.hand.showSkeleton = toggleSkeleton.checked
         })
+
+        if (gestureSensitivity) {
+          gestureSensitivity.value = STATE.gestureSensitivity || 'medium'
+          gestureSensitivity.addEventListener('change', () => {
+            STATE.gestureSensitivity = gestureSensitivity.value
+          })
+        }
 
         if (menuHideUiBtn) {
           menuHideUiBtn.addEventListener('click', () => setUiHidden(true))
@@ -2218,7 +2264,8 @@
         if (handActive) {
           STATE.drag.vx = 0
           STATE.drag.vy = 0
-          const rotStrength = STATE.mode === 'TREE' ? 2.6 : 2.4
+          const sens = getGestureSensitivityConfig()
+          const rotStrength = (STATE.mode === 'TREE' ? 2.6 : 2.4) * sens.rot
           const hx = THREE.MathUtils.clamp(STATE.hand.x, -1, 1)
           const hy = THREE.MathUtils.clamp(STATE.hand.y, -1, 1)
           const targetRotY = hx * Math.PI * rotStrength
@@ -2228,8 +2275,8 @@
               : STATE.mode === 'SCATTER'
                 ? hy * Math.PI * (0.25 * rotStrength)
                 : STATE.rotation.x
-          STATE.rotation.y += (targetRotY - STATE.rotation.y) * 3.0 * dt
-          const xFollow = STATE.mode === 'TREE' ? 5.5 : 3.0
+          STATE.rotation.y += (targetRotY - STATE.rotation.y) * (3.0 * sens.follow) * dt
+          const xFollow = (STATE.mode === 'TREE' ? 5.5 : 3.0) * sens.follow
           STATE.rotation.x += (targetRotX - STATE.rotation.x) * xFollow * dt
         } else if (dragActive) {
           if (!STATE.drag.active) {
