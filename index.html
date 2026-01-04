@@ -262,30 +262,6 @@
         box-shadow: 0 0 18px rgba(212, 175, 55, 0.25);
       }
 
-      #mode-toggle-btn {
-        margin-top: 10px;
-        width: 38px;
-        height: 28px;
-        background: rgba(20, 20, 20, 0.6);
-        border: 1px solid rgba(212, 175, 55, 0.4);
-        border-radius: 6px;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        backdrop-filter: blur(5px);
-        transition: all 0.25s;
-        color: rgba(212, 175, 55, 0.95);
-        font-size: 14px;
-        letter-spacing: 0px;
-        user-select: none;
-      }
-
-      #mode-toggle-btn:hover {
-        background: rgba(212, 175, 55, 0.18);
-        box-shadow: 0 0 18px rgba(212, 175, 55, 0.25);
-      }
-
       .hamburger {
         width: 18px;
         height: 12px;
@@ -567,7 +543,6 @@
         <button id="settings-btn" aria-label="设置">
           <div class="hamburger"><span></span></div>
         </button>
-        <button id="mode-toggle-btn" aria-label="切换模式">⇄</button>
         <div id="settings-panel" class="hidden">
           <div class="menu-title">设置</div>
           <button id="menu-upload-btn" class="menu-btn">上传照片</button>
@@ -680,7 +655,6 @@
       let clock = new THREE.Clock()
       let particleSystem = []
       let photoMeshGroup = new THREE.Group()
-      let modeToggleBtn
       let handLandmarker, video, webcamCanvas, webcamCtx
       let caneTexture, snowflakeTexture
       let snowflakeSystem
@@ -733,11 +707,11 @@
         if (vp.portrait) {
           fov = vp.compact ? 56 : 52
           camY = 1.8
-          camZ = mode === 'SCATTER' ? (vp.compact ? 82 : 77) : mode === 'FOCUS' ? (vp.compact ? 74 : 71) : vp.compact ? 71 : 68
-          if (vp.compact) camZ += 2
+          camZ = mode === 'SCATTER' ? (vp.compact ? 79 : 74) : vp.compact ? 67 : 64
+          if (vp.compact) camZ += 1
         }
 
-        if (vp.portrait && (mode === 'SCATTER' || mode === 'FOCUS')) {
+        if (vp.portrait && mode === 'SCATTER') {
           const photoCount = particleSystem ? particleSystem.filter((p) => p.type === 'PHOTO').length : 0
           const extra = Math.max(0, photoCount - 24)
           if (extra > 0) {
@@ -753,7 +727,7 @@
         camera.updateProjectionMatrix()
 
         if (giftBoxGroup) {
-          giftBoxBaseScale = vp.portrait ? (vp.compact ? 1.24 : 1.42) : 1.85
+          giftBoxBaseScale = 1.85
           giftBoxGroup.position.set(0, vp.portrait ? (vp.compact ? -8.15 : -7.9) : -7.2, vp.portrait ? (vp.compact ? 19.5 : 19) : 18)
           _giftBoxBasePos.copy(giftBoxGroup.position)
           giftBoxGroup.scale.setScalar(giftBoxBaseScale)
@@ -866,11 +840,6 @@
         return added
       }
 
-      function updateModeToggleBtn() {
-        if (!modeToggleBtn) return
-        modeToggleBtn.textContent = '⇄'
-      }
-
       function pickPhotoGroupAt(clientX, clientY) {
         if (!renderer || !camera || !photoMeshGroup) return null
         if (!photoMeshGroup.children.length) return null
@@ -905,11 +874,16 @@
       function setMode(nextMode) {
         if (STATE.intro && STATE.intro.phase !== 'DONE') return
         if (STATE.mode === nextMode) return
+        const prevMode = STATE.mode
         STATE.mode = nextMode
         if (STATE.gesture) STATE.gesture.lastSwitchMs = performance.now()
         if (nextMode !== 'FOCUS') STATE.focusTarget = null
-        updateModeToggleBtn()
-        applyResponsiveLayout()
+        const vp = getViewportProfile()
+        const skipCameraRelayout =
+          vp.portrait &&
+          ((prevMode === 'SCATTER' && nextMode === 'FOCUS') ||
+            (prevMode === 'FOCUS' && nextMode === 'SCATTER'))
+        if (!skipCameraRelayout) applyResponsiveLayout()
         if (nextMode === 'SCATTER' || nextMode === 'FOCUS') relayoutScatterPhotos()
       }
 
@@ -2216,7 +2190,10 @@
             // Large preview size in scatter
             s = this.baseScale * 2.5
           } else if (activeMode === 'FOCUS') {
-            if (this.mesh === focusTargetMesh) s = 4.5
+            if (this.mesh === focusTargetMesh) {
+              const vp = getViewportProfile()
+              s = vp.portrait ? 11.25 : 4.5
+            }
             else if (this.type === 'PHOTO') s = this.baseScale * 2.5
             else s = this.baseScale
           }
@@ -2849,7 +2826,6 @@
         const menuHideUiBtn = document.getElementById('menu-hide-ui-btn')
         const toggleSkeleton = document.getElementById('toggle-skeleton')
         const gestureSensitivity = document.getElementById('gesture-sensitivity')
-        modeToggleBtn = document.getElementById('mode-toggle-btn')
         const uiLayer = document.getElementById('ui-layer')
         const webcamWrapper = document.getElementById('webcam-wrapper')
         const photoManager = document.getElementById('photo-manager')
@@ -2898,15 +2874,6 @@
           e.stopPropagation()
           toggleSettings()
         })
-
-        updateModeToggleBtn()
-        if (modeToggleBtn) {
-          modeToggleBtn.addEventListener('click', (e) => {
-            e.stopPropagation()
-            closeSettings()
-            setMode(STATE.mode === 'TREE' ? 'SCATTER' : 'TREE')
-          })
-        }
 
         settingsPanel.addEventListener('click', (e) => e.stopPropagation())
 
@@ -3051,6 +3018,8 @@
               STATE.focusTarget = tapPhoto
             } else if (wasActive && STATE.mode === 'FOCUS') {
               setMode('SCATTER')
+            } else if (wasActive && (STATE.mode === 'TREE' || STATE.mode === 'SCATTER')) {
+              setMode(STATE.mode === 'TREE' ? 'SCATTER' : 'TREE')
             }
           }
         }
