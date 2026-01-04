@@ -693,6 +693,7 @@
       let giftBoxInnerLight
       let giftBoxGlow
       let giftSparkleRig
+      let giftBoxBaseScale = 1.85
       const _giftBoxBasePos = new THREE.Vector3()
       const _giftTmp = new THREE.Vector3()
       const _introEmitFrom = new THREE.Vector3()
@@ -708,6 +709,55 @@
       const smoothstep = (edge0, edge1, x) => {
         const t = clamp01((x - edge0) / (edge1 - edge0))
         return t * t * (3 - 2 * t)
+      }
+
+      const getViewportProfile = () => {
+        const w = window.innerWidth || 1
+        const h = window.innerHeight || 1
+        const aspect = w / h
+        const portrait = h > w && aspect < 0.85
+        const compact = Math.min(w, h) < 520
+        return { w, h, aspect, portrait, compact }
+      }
+
+      const applyResponsiveLayout = () => {
+        if (!camera) return
+        const vp = getViewportProfile()
+        const introActive = STATE.intro && STATE.intro.phase !== 'DONE'
+        const mode = introActive ? 'TREE' : STATE.mode
+
+        let fov = 42
+        let camZ = CONFIG.camera.z
+        let camY = 2
+
+        if (vp.portrait) {
+          fov = vp.compact ? 56 : 52
+          camY = 1.8
+          camZ = mode === 'SCATTER' ? (vp.compact ? 82 : 77) : mode === 'FOCUS' ? (vp.compact ? 74 : 71) : vp.compact ? 71 : 68
+          if (vp.compact) camZ += 2
+        }
+
+        if (vp.portrait && (mode === 'SCATTER' || mode === 'FOCUS')) {
+          const photoCount = particleSystem ? particleSystem.filter((p) => p.type === 'PHOTO').length : 0
+          const extra = Math.max(0, photoCount - 24)
+          if (extra > 0) {
+            const scale = vp.portrait ? (mode === 'SCATTER' ? 0.6 : 0.35) : mode === 'SCATTER' ? 0.45 : 0.25
+            const cap = vp.portrait ? (mode === 'SCATTER' ? 22 : 12) : mode === 'SCATTER' ? 18 : 10
+            camZ += Math.min(cap, extra * scale)
+          }
+        }
+
+        camera.fov = fov
+        camera.aspect = vp.w / vp.h
+        camera.position.set(0, camY, camZ)
+        camera.updateProjectionMatrix()
+
+        if (giftBoxGroup) {
+          giftBoxBaseScale = vp.portrait ? (vp.compact ? 1.24 : 1.42) : 1.85
+          giftBoxGroup.position.set(0, vp.portrait ? (vp.compact ? -8.15 : -7.9) : -7.2, vp.portrait ? (vp.compact ? 19.5 : 19) : 18)
+          _giftBoxBasePos.copy(giftBoxGroup.position)
+          giftBoxGroup.scale.setScalar(giftBoxBaseScale)
+        }
       }
 
       const PHOTO_STORE = {
@@ -859,6 +909,8 @@
         if (STATE.gesture) STATE.gesture.lastSwitchMs = performance.now()
         if (nextMode !== 'FOCUS') STATE.focusTarget = null
         updateModeToggleBtn()
+        applyResponsiveLayout()
+        if (nextMode === 'SCATTER' || nextMode === 'FOCUS') relayoutScatterPhotos()
       }
 
       function getGestureSensitivityConfig() {
@@ -870,6 +922,7 @@
 
       async function init() {
         initThree()
+        applyResponsiveLayout()
         setupEnvironment()
         setupLights()
         createTextures()
@@ -880,6 +933,7 @@
         if (!restored) createDefaultPhotos()
         createOccluder()
         createGiftBox()
+        applyResponsiveLayout()
         setMainContentVisible(false)
         setupPostProcessing()
         setupEvents()
@@ -1033,7 +1087,7 @@
             giftBoxGroup.position.copy(_giftBoxBasePos).add(_giftTmp.set(0, bob, 0))
             giftBoxGroup.rotation.y = sway
             giftBoxGroup.rotation.z = 0.035 * Math.sin(tt * 1.1)
-            giftBoxGroup.scale.setScalar(1.85 * (1 + 0.02 * Math.sin(tt * 1.6)))
+            giftBoxGroup.scale.setScalar(giftBoxBaseScale * (1 + 0.02 * Math.sin(tt * 1.6)))
             _introEmitFrom.set(
               giftBoxGroup.position.x,
               giftBoxGroup.position.y + 4.2 * giftBoxGroup.scale.y * 0.58,
@@ -1113,7 +1167,7 @@
         }
         if (giftBoxGroup) {
           giftBoxGroup.visible = alpha > 0.01
-          giftBoxGroup.scale.setScalar(1.85 * (1 - 0.08 * fadeT))
+          giftBoxGroup.scale.setScalar(giftBoxBaseScale * (1 - 0.08 * fadeT))
         }
         if (giftSparkleRig && giftBoxGroup?.visible) {
           const tt = clock.elapsedTime
@@ -2407,11 +2461,12 @@
         const n = photos.length
         if (!n) return
 
-        const centerY = 1.5
-        const baseDist = 14
-        const dist = Math.max(baseDist, 10 + n * 0.45)
-        const levels = Math.min(4, Math.max(2, Math.ceil(n / 10)))
-        const span = Math.min(4.8, dist * 0.33)
+        const vp = getViewportProfile()
+        const centerY = vp.portrait ? 1.2 : 1.5
+        const baseDist = vp.portrait ? 12 : 14
+        const dist = Math.max(baseDist, (vp.portrait ? 9 : 10) + n * (vp.portrait ? 0.34 : 0.45))
+        const levels = Math.min(vp.portrait ? 3 : 4, Math.max(2, Math.ceil(n / (vp.portrait ? 12 : 10))))
+        const span = Math.min(vp.portrait ? 3.9 : 4.8, dist * (vp.portrait ? 0.28 : 0.33))
 
         const yLevels = []
         if (levels === 1) yLevels.push(0)
@@ -2430,13 +2485,15 @@
           if (!m) continue
           const y = yLevels[l] ?? 0
           const r = Math.sqrt(Math.max(0.01, dist * dist - y * y))
+          const rx = vp.portrait ? r * 0.72 : r
+          const rz = vp.portrait ? r * 0.98 : r
           const offset = (l / levels) * (Math.PI / 3)
           for (let j = 0; j < m; j++) {
             const a = (j / m) * Math.PI * 2 + offset
             bucket[j].posScatter.set(
-              Math.cos(a) * r,
+              Math.cos(a) * rx,
               centerY + y,
-              Math.sin(a) * r
+              Math.sin(a) * rz
             )
           }
         }
@@ -2777,10 +2834,10 @@
 
       function setupEvents() {
         window.addEventListener('resize', () => {
-          camera.aspect = window.innerWidth / window.innerHeight
-          camera.updateProjectionMatrix()
           renderer.setSize(window.innerWidth, window.innerHeight)
-          composer.setSize(window.innerWidth, window.innerHeight)
+          if (composer) composer.setSize(window.innerWidth, window.innerHeight)
+          applyResponsiveLayout()
+          if (STATE.mode === 'SCATTER' || STATE.mode === 'FOCUS') relayoutScatterPhotos()
         })
         const fileInput = document.getElementById('file-input')
         fileInput.addEventListener('change', handleImageUpload)
