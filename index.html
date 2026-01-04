@@ -707,7 +707,7 @@
         if (vp.portrait) {
           fov = vp.compact ? 56 : 52
           camY = 1.8
-          camZ = mode === 'SCATTER' ? (vp.compact ? 79 : 74) : vp.compact ? 67 : 64
+          camZ = mode === 'SCATTER' ? (vp.compact ? 75 : 70) : vp.compact ? 63 : 60
           if (vp.compact) camZ += 1
         }
 
@@ -2192,7 +2192,7 @@
           } else if (activeMode === 'FOCUS') {
             if (this.mesh === focusTargetMesh) {
               const vp = getViewportProfile()
-              s = vp.portrait ? 11.25 : 4.5
+              s = vp.portrait ? 12.0 : 4.5
             }
             else if (this.type === 'PHOTO') s = this.baseScale * 2.5
             else s = this.baseScale
