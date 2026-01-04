@@ -672,6 +672,7 @@
         },
         rotation: { x: 0, y: 0 },
         uiHidden: false,
+        intro: { phase: 'BOX', startMs: 0, emitT: 0, particlesVisible: false },
       }
 
       let scene, camera, renderer, composer
@@ -686,8 +687,134 @@
       let ribbonSystem
       let starRig
       let occluder
+      let giftBoxGroup
+      let giftBoxLidPivot
+      let giftBoxMaterials = []
+      let giftBoxInnerLight
+      let giftBoxGlow
+      let giftSparkleRig
+      const _giftBoxBasePos = new THREE.Vector3()
+      const _giftTmp = new THREE.Vector3()
+      const _introEmitFrom = new THREE.Vector3()
       const _photoRaycaster = new THREE.Raycaster()
       const _photoNdc = new THREE.Vector2()
+
+      const clamp01 = (v) => Math.min(1, Math.max(0, v))
+      const easeOutCubic = (t) => 1 - Math.pow(1 - clamp01(t), 3)
+      const easeInOutCubic = (t) => {
+        const x = clamp01(t)
+        return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2
+      }
+      const smoothstep = (edge0, edge1, x) => {
+        const t = clamp01((x - edge0) / (edge1 - edge0))
+        return t * t * (3 - 2 * t)
+      }
+
+      const PHOTO_STORE = {
+        db: null,
+        opening: null,
+      }
+
+      const openPhotoDb = () => {
+        if (PHOTO_STORE.db) return Promise.resolve(PHOTO_STORE.db)
+        if (PHOTO_STORE.opening) return PHOTO_STORE.opening
+        PHOTO_STORE.opening = new Promise((resolve, reject) => {
+          const req = indexedDB.open('ChristmasTreePhotosDB', 1)
+          req.onupgradeneeded = () => {
+            const db = req.result
+            if (!db.objectStoreNames.contains('photos')) {
+              db.createObjectStore('photos', { keyPath: 'id', autoIncrement: true })
+            }
+          }
+          req.onsuccess = () => {
+            PHOTO_STORE.db = req.result
+            PHOTO_STORE.opening = null
+            resolve(PHOTO_STORE.db)
+          }
+          req.onerror = () => {
+            PHOTO_STORE.opening = null
+            reject(req.error)
+          }
+        })
+        return PHOTO_STORE.opening
+      }
+
+      const reqToPromise = (req) =>
+        new Promise((resolve, reject) => {
+          req.onsuccess = () => resolve(req.result)
+          req.onerror = () => reject(req.error)
+        })
+
+      const txDone = (tx) =>
+        new Promise((resolve, reject) => {
+          tx.oncomplete = () => resolve()
+          tx.onabort = () => reject(tx.error || new Error('Transaction aborted'))
+          tx.onerror = () => reject(tx.error)
+        })
+
+      const savePhotoBlob = async (blob) => {
+        const db = await openPhotoDb()
+        const tx = db.transaction('photos', 'readwrite')
+        const store = tx.objectStore('photos')
+        const id = await reqToPromise(store.add({ blob, createdAt: Date.now() }))
+        await txDone(tx)
+        return id
+      }
+
+      const deletePhotoBlob = async (id) => {
+        const db = await openPhotoDb()
+        const tx = db.transaction('photos', 'readwrite')
+        const store = tx.objectStore('photos')
+        await reqToPromise(store.delete(id))
+        await txDone(tx)
+      }
+
+      const loadAllPhotoBlobs = async () => {
+        const db = await openPhotoDb()
+        const tx = db.transaction('photos', 'readonly')
+        const store = tx.objectStore('photos')
+        const rows = await reqToPromise(store.getAll())
+        await txDone(tx)
+        return rows
+      }
+
+      const loadTextureFromUrl = (url) =>
+        new Promise((resolve, reject) => {
+          new THREE.TextureLoader().load(
+            url,
+            (t) => resolve(t),
+            undefined,
+            (err) => reject(err)
+          )
+        })
+
+      const restoreSavedPhotos = async () => {
+        let rows = []
+        try {
+          rows = await loadAllPhotoBlobs()
+        } catch {
+          return 0
+        }
+        rows.sort((a, b) => (a.id ?? 0) - (b.id ?? 0))
+        let added = 0
+        for (const row of rows) {
+          const blob = row?.blob
+          const id = row?.id
+          if (!blob || typeof id !== 'number') continue
+          const url = URL.createObjectURL(blob)
+          try {
+            const t = await loadTextureFromUrl(url)
+            t.colorSpace = THREE.SRGBColorSpace
+            addPhotoToScene(t, { photoId: id, objectUrl: url })
+            added++
+          } catch {
+            try {
+              URL.revokeObjectURL(url)
+            } catch {}
+          }
+        }
+        return added
+      }
 
       function updateModeToggleBtn() {
         if (!modeToggleBtn) return
@@ -713,7 +840,20 @@
         return null
       }
 
+      function pickGiftBoxAt(clientX, clientY) {
+        if (!renderer || !camera || !giftBoxGroup) return false
+        if (!giftBoxGroup.visible) return false
+        const rect = renderer.domElement.getBoundingClientRect()
+        const x = ((clientX - rect.left) / rect.width) * 2 - 1
+        const y = -(((clientY - rect.top) / rect.height) * 2 - 1)
+        _photoNdc.set(x, y)
+        _photoRaycaster.setFromCamera(_photoNdc, camera)
+        const hits = _photoRaycaster.intersectObject(giftBoxGroup, true)
+        return hits.length > 0
+      }
+
       function setMode(nextMode) {
+        if (STATE.intro && STATE.intro.phase !== 'DONE') return
         if (STATE.mode === nextMode) return
         STATE.mode = nextMode
         if (STATE.gesture) STATE.gesture.lastSwitchMs = performance.now()
@@ -736,8 +876,11 @@
         createParticles()
         createRibbon()
         createDust()
-        createDefaultPhotos()
+        const restored = await restoreSavedPhotos()
+        if (!restored) createDefaultPhotos()
         createOccluder()
+        createGiftBox()
+        setMainContentVisible(false)
         setupPostProcessing()
         setupEvents()
         await initMediaPipe()
@@ -840,6 +983,572 @@
         occluder.position.set(0, 0, -0.25)
         occluder.frustumCulled = false
         scene.add(occluder)
+      }
+
+      function setMainContentVisible(visible) {
+        particleSystem.forEach((p) => {
+          if (p?.mesh) p.mesh.visible = visible
+        })
+        if (snowflakeSystem?.mesh) snowflakeSystem.mesh.visible = visible
+        if (ribbonSystem?.mesh) ribbonSystem.mesh.visible = visible
+        if (starRig?.group) starRig.group.visible = visible
+        if (occluder) occluder.visible = false
+        STATE.intro.particlesVisible = visible
+      }
+
+      function startIntroOpen() {
+        if (!STATE.intro || STATE.intro.phase !== 'BOX') return
+        STATE.intro.phase = 'OPENING'
+        STATE.intro.startMs = performance.now()
+        STATE.intro.emitT = 0
+        STATE.intro.particlesVisible = false
+      }
+
+      function updateIntro(dt) {
+        const intro = STATE.intro
+        if (!intro || intro.phase === 'DONE') return
+
+        if (intro.phase === 'BOX') {
+          intro.emitT = 0
+          if (giftBoxGroup) giftBoxGroup.visible = true
+          if (giftBoxLidPivot) giftBoxLidPivot.rotation.x = 0
+          giftBoxMaterials.forEach((m) => {
+            m.transparent = true
+            m.opacity = 1
+          })
+          if (giftBoxInnerLight) giftBoxInnerLight.intensity = 0
+          if (giftBoxGlow?.material) {
+            giftBoxGlow.material.transparent = true
+            giftBoxGlow.material.opacity = 0.85
+          }
+          if (giftSparkleRig) {
+            giftSparkleRig.points.visible = true
+            giftSparkleRig.material.transparent = true
+            giftSparkleRig.material.opacity = 1
+          }
+          if (giftBoxGroup) {
+            const tt = clock.elapsedTime
+            const bob = 0.32 * Math.sin(tt * 1.35)
+            const sway = 0.14 * Math.sin(tt * 0.9)
+            giftBoxGroup.position.copy(_giftBoxBasePos).add(_giftTmp.set(0, bob, 0))
+            giftBoxGroup.rotation.y = sway
+            giftBoxGroup.rotation.z = 0.035 * Math.sin(tt * 1.1)
+            giftBoxGroup.scale.setScalar(1.85 * (1 + 0.02 * Math.sin(tt * 1.6)))
+            _introEmitFrom.set(
+              giftBoxGroup.position.x,
+              giftBoxGroup.position.y + 4.2 * giftBoxGroup.scale.y * 0.58,
+              giftBoxGroup.position.z + 6.2 * giftBoxGroup.scale.y * 0.05
+            )
+          }
+          if (giftSparkleRig) {
+            const tt = clock.elapsedTime
+            const p = giftSparkleRig.positions
+            for (let i = 0; i < giftSparkleRig.count; i++) {
+              giftSparkleRig.angles[i] += giftSparkleRig.speeds[i] * dt
+              giftSparkleRig.heights[i] += giftSparkleRig.rises[i] * dt
+              if (giftSparkleRig.heights[i] > giftSparkleRig.maxH) {
+                giftSparkleRig.heights[i] = giftSparkleRig.minH
+                giftSparkleRig.angles[i] = Math.random() * Math.PI * 2
+                giftSparkleRig.radii[i] =
+                  giftSparkleRig.minR +
+                  Math.random() * (giftSparkleRig.maxR - giftSparkleRig.minR)
+              }
+              const a = giftSparkleRig.angles[i]
+              const r =
+                giftSparkleRig.radii[i] +
+                0.18 * Math.sin(tt * 1.3 + giftSparkleRig.phases[i])
+              const y =
+                giftSparkleRig.heights[i] +
+                0.12 * Math.sin(tt * 2.2 + giftSparkleRig.phases[i])
+              p[i * 3 + 0] = Math.cos(a) * r
+              p[i * 3 + 1] = y
+              p[i * 3 + 2] = Math.sin(a) * r
+            }
+            giftSparkleRig.geometry.attributes.position.needsUpdate = true
+          }
+          return
+        }
+
+        const now = performance.now()
+        const t = clamp01((now - intro.startMs) / 5600)
+        const openT = smoothstep(0.0, 0.35, t)
+        intro.emitT = clamp01((t - 0.02) / 0.98)
+
+        if (!intro.particlesVisible && intro.emitT > 0) {
+          setMainContentVisible(true)
+          particleSystem.forEach((p) => {
+            if (p?.mesh) p.mesh.position.copy(_introEmitFrom)
+          })
+          if (snowflakeSystem?.items) {
+            for (let i = 0; i < snowflakeSystem.items.length; i++) {
+              snowflakeSystem.items[i].pos.copy(_introEmitFrom)
+            }
+          }
+          if (ribbonSystem?.items) {
+            for (let i = 0; i < ribbonSystem.items.length; i++) {
+              ribbonSystem.items[i].pos.copy(_introEmitFrom)
+            }
+          }
+        }
+
+        if (giftBoxLidPivot) giftBoxLidPivot.rotation.x = -openT * Math.PI * 0.82
+
+        const fadeT = smoothstep(0.06, 0.42, intro.emitT)
+        const alpha = 1 - fadeT
+        giftBoxMaterials.forEach((m) => {
+          m.transparent = true
+          m.opacity = alpha
+        })
+        if (giftBoxInnerLight) {
+          const on = smoothstep(0.12, 0.28, intro.emitT)
+          giftBoxInnerLight.intensity = 4.2 * on * alpha
+        }
+        if (giftBoxGlow?.material) {
+          giftBoxGlow.material.transparent = true
+          giftBoxGlow.material.opacity = 0.85 * alpha
+        }
+        if (giftSparkleRig) {
+          giftSparkleRig.material.transparent = true
+          giftSparkleRig.material.opacity = alpha
+        }
+        if (giftBoxGroup) {
+          giftBoxGroup.visible = alpha > 0.01
+          giftBoxGroup.scale.setScalar(1.85 * (1 - 0.08 * fadeT))
+        }
+        if (giftSparkleRig && giftBoxGroup?.visible) {
+          const tt = clock.elapsedTime
+          const p = giftSparkleRig.positions
+          for (let i = 0; i < giftSparkleRig.count; i++) {
+            giftSparkleRig.angles[i] +=
+              giftSparkleRig.speeds[i] * dt * (1 + 0.45 * intro.emitT)
+            giftSparkleRig.heights[i] +=
+              giftSparkleRig.rises[i] * dt * (1 + 0.65 * intro.emitT)
+            if (giftSparkleRig.heights[i] > giftSparkleRig.maxH) {
+              giftSparkleRig.heights[i] = giftSparkleRig.minH
+              giftSparkleRig.angles[i] = Math.random() * Math.PI * 2
+              giftSparkleRig.radii[i] =
+                giftSparkleRig.minR +
+                Math.random() * (giftSparkleRig.maxR - giftSparkleRig.minR)
+            }
+            const a = giftSparkleRig.angles[i]
+            const r =
+              giftSparkleRig.radii[i] +
+              0.16 * Math.sin(tt * 1.4 + giftSparkleRig.phases[i])
+            const y =
+              giftSparkleRig.heights[i] +
+              0.16 * Math.sin(tt * 2.35 + giftSparkleRig.phases[i])
+            p[i * 3 + 0] = Math.cos(a) * r
+            p[i * 3 + 1] = y
+            p[i * 3 + 2] = Math.sin(a) * r
+          }
+          giftSparkleRig.geometry.attributes.position.needsUpdate = true
+        }
+        if (giftBoxGroup) {
+          _introEmitFrom.set(
+            giftBoxGroup.position.x,
+            giftBoxGroup.position.y + 4.2 * giftBoxGroup.scale.y * 0.58,
+            giftBoxGroup.position.z + 6.2 * giftBoxGroup.scale.y * 0.05
+          )
+        }
+
+        if (t >= 1) {
+          intro.phase = 'DONE'
+          intro.emitT = 1
+          if (giftBoxGroup) giftBoxGroup.visible = false
+        }
+      }
+
+      function createGiftBox() {
+        giftBoxMaterials = []
+
+        const group = new THREE.Group()
+        const w = 6.2
+        const h = 4.2
+        const d = 6.2
+        const lidH = 0.62
+
+        const hexToCss = (hex) => `#${hex.toString(16).padStart(6, '0')}`
+        const makeBoxTexture = (baseHex, accentHex) => {
+          const c = document.createElement('canvas')
+          c.width = 512
+          c.height = 512
+          const ctx = c.getContext('2d')
+          const base = hexToCss(baseHex)
+          const accent = hexToCss(accentHex)
+
+          const grad = ctx.createLinearGradient(40, 40, 472, 472)
+          grad.addColorStop(0, base)
+          grad.addColorStop(0.45, '#fff4fb')
+          grad.addColorStop(1, base)
+          ctx.fillStyle = grad
+          ctx.fillRect(0, 0, 512, 512)
+
+          ctx.globalAlpha = 0.22
+          ctx.fillStyle = 'rgba(255,255,255,0.85)'
+          for (let i = -200; i < 800; i += 52) {
+            ctx.save()
+            ctx.translate(i, 0)
+            ctx.rotate(Math.PI / 4)
+            ctx.fillRect(0, 0, 24, 900)
+            ctx.restore()
+          }
+
+          const drawHeart = (x, y, s, r, a) => {
+            ctx.save()
+            ctx.translate(x, y)
+            ctx.rotate(r)
+            ctx.scale(s, s)
+            ctx.globalAlpha = a
+            ctx.fillStyle = accent
+            ctx.beginPath()
+            ctx.moveTo(0, 0.3)
+            ctx.bezierCurveTo(-0.7, -0.25, -0.65, -1.05, 0, -0.72)
+            ctx.bezierCurveTo(0.65, -1.05, 0.7, -0.25, 0, 0.3)
+            ctx.closePath()
+            ctx.fill()
+            ctx.restore()
+          }
+
+          for (let yy = 40; yy < 512; yy += 74) {
+            for (let xx = 34; xx < 512; xx += 86) {
+              drawHeart(
+                xx + (Math.random() - 0.5) * 22,
+                yy + (Math.random() - 0.5) * 18,
+                18 + Math.random() * 10,
+                (Math.random() - 0.5) * 0.6,
+                0.08 + Math.random() * 0.12
+              )
+            }
+          }
+
+          ctx.globalAlpha = 0.18
+          ctx.strokeStyle = 'rgba(255,255,255,0.7)'
+          ctx.lineWidth = 6
+          ctx.strokeRect(16, 16, 480, 480)
+
+          const tex = new THREE.CanvasTexture(c)
+          tex.colorSpace = THREE.SRGBColorSpace
+          tex.anisotropy = 8
+          tex.needsUpdate = true
+          return tex
+        }
+
+        const makeGlitterTexture = () => {
+          const c = document.createElement('canvas')
+          c.width = 512
+          c.height = 512
+          const ctx = c.getContext('2d')
+          ctx.fillStyle = '#ffd48a'
+          ctx.fillRect(0, 0, 512, 512)
+          for (let i = 0; i < 1200; i++) {
+            const x = Math.random() * 512
+            const y = Math.random() * 512
+            const r = Math.random() < 0.85 ? 1 : 2.2
+            ctx.globalAlpha = 0.15 + Math.random() * 0.35
+            ctx.fillStyle =
+              Math.random() < 0.5
+                ? 'rgba(255,255,255,1)'
+                : 'rgba(255,238,200,1)'
+            ctx.beginPath()
+            ctx.arc(x, y, r, 0, Math.PI * 2)
+            ctx.fill()
+          }
+          ctx.globalAlpha = 0.25
+          const grad = ctx.createLinearGradient(0, 0, 512, 0)
+          grad.addColorStop(0, 'rgba(255,255,255,0)')
+          grad.addColorStop(0.5, 'rgba(255,255,255,0.35)')
+          grad.addColorStop(1, 'rgba(255,255,255,0)')
+          ctx.fillStyle = grad
+          ctx.fillRect(0, 0, 512, 512)
+
+          const tex = new THREE.CanvasTexture(c)
+          tex.colorSpace = THREE.SRGBColorSpace
+          tex.wrapS = THREE.RepeatWrapping
+          tex.wrapT = THREE.RepeatWrapping
+          tex.repeat.set(2, 2)
+          tex.anisotropy = 8
+          tex.needsUpdate = true
+          return tex
+        }
+
+        const makeGlowTexture = () => {
+          const c = document.createElement('canvas')
+          c.width = 128
+          c.height = 128
+          const ctx = c.getContext('2d')
+          const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64)
+          g.addColorStop(0, 'rgba(255,220,180,0.9)')
+          g.addColorStop(0.35, 'rgba(255,210,180,0.4)')
+          g.addColorStop(0.7, 'rgba(255,120,190,0.12)')
+          g.addColorStop(1, 'rgba(255,120,190,0)')
+          ctx.fillStyle = g
+          ctx.fillRect(0, 0, 128, 128)
+          const tex = new THREE.CanvasTexture(c)
+          tex.colorSpace = THREE.SRGBColorSpace
+          tex.needsUpdate = true
+          return tex
+        }
+
+        const boxTex = makeBoxTexture(0xff6aa6, 0xffd7b3)
+        const lidTex = makeBoxTexture(0xfff0f7, 0xff6aa6)
+        const glitterTex = makeGlitterTexture()
+
+        const baseMat = new THREE.MeshPhysicalMaterial({
+          color: 0xffffff,
+          map: boxTex,
+          metalness: 0.15,
+          roughness: 0.26,
+          clearcoat: 1.0,
+          clearcoatRoughness: 0.14,
+          envMapIntensity: 1.25,
+          emissive: 0x2b0814,
+          emissiveIntensity: 0.2,
+        })
+        baseMat.transparent = true
+        baseMat.opacity = 1
+        giftBoxMaterials.push(baseMat)
+
+        const lidMat = new THREE.MeshPhysicalMaterial({
+          color: 0xffffff,
+          map: lidTex,
+          metalness: 0.0,
+          roughness: 0.72,
+          clearcoat: 0.18,
+          clearcoatRoughness: 0.75,
+          envMapIntensity: 0.35,
+          emissive: 0x12040a,
+          emissiveIntensity: 0.06,
+        })
+        lidMat.transparent = true
+        lidMat.opacity = 1
+        giftBoxMaterials.push(lidMat)
+
+        const ribbonMat = new THREE.MeshPhysicalMaterial({
+          color: 0xffffff,
+          map: glitterTex,
+          metalness: 0.35,
+          roughness: 0.48,
+          clearcoat: 0.65,
+          clearcoatRoughness: 0.55,
+          envMapIntensity: 0.9,
+          emissive: 0xffd8a6,
+          emissiveIntensity: 0.16,
+        })
+        ribbonMat.transparent = true
+        ribbonMat.opacity = 1
+        giftBoxMaterials.push(ribbonMat)
+
+        const base = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), baseMat)
+        base.position.y = h / 2
+        group.add(base)
+
+        const edgeMat = new THREE.LineBasicMaterial({
+          color: 0xfff1d6,
+          transparent: true,
+          opacity: 0.4,
+          blending: THREE.AdditiveBlending,
+        })
+        edgeMat.toneMapped = false
+        giftBoxMaterials.push(edgeMat)
+
+        const baseEdges = new THREE.LineSegments(
+          new THREE.EdgesGeometry(base.geometry, 35),
+          edgeMat
+        )
+        baseEdges.position.copy(base.position)
+        group.add(baseEdges)
+
+        const ribbonX = new THREE.Mesh(new THREE.BoxGeometry(w * 0.13, h + 0.02, d + 0.04), ribbonMat)
+        ribbonX.position.y = (h + 0.02) / 2
+        group.add(ribbonX)
+
+        const ribbonZ = new THREE.Mesh(new THREE.BoxGeometry(w + 0.04, h + 0.02, d * 0.13), ribbonMat)
+        ribbonZ.position.y = (h + 0.02) / 2
+        group.add(ribbonZ)
+
+        const lidPivot = new THREE.Group()
+        lidPivot.position.set(0, h, -d / 2)
+        group.add(lidPivot)
+        giftBoxLidPivot = lidPivot
+
+        const lid = new THREE.Mesh(new THREE.BoxGeometry(w + 0.26, lidH, d + 0.26), lidMat)
+        lid.position.set(0, lidH / 2, d / 2)
+        lidPivot.add(lid)
+
+        const lidEdges = new THREE.LineSegments(
+          new THREE.EdgesGeometry(lid.geometry, 35),
+          edgeMat
+        )
+        lidEdges.position.copy(lid.position)
+        lidPivot.add(lidEdges)
+
+        const lidRibbonX = new THREE.Mesh(new THREE.BoxGeometry(w * 0.13, lidH + 0.02, d + 0.3), ribbonMat)
+        lidRibbonX.position.set(0, lidH / 2 + 0.01, d / 2)
+        lidPivot.add(lidRibbonX)
+
+        const lidRibbonZ = new THREE.Mesh(new THREE.BoxGeometry(w + 0.3, lidH + 0.02, d * 0.13), ribbonMat)
+        lidRibbonZ.position.set(0, lidH / 2 + 0.01, d / 2)
+        lidPivot.add(lidRibbonZ)
+
+        const bowGroup = new THREE.Group()
+        bowGroup.position.set(0, lidH + 0.16, d / 2)
+        bowGroup.rotation.x = -0.08
+        lidPivot.add(bowGroup)
+
+        const knot = new THREE.Mesh(new THREE.SphereGeometry(0.22, 18, 12), ribbonMat)
+        knot.scale.set(1.05, 0.78, 1.05)
+        bowGroup.add(knot)
+
+        const makeRibbonShape = (width, thickness) => {
+          const s = new THREE.Shape()
+          const w2 = width / 2
+          const t2 = thickness / 2
+          s.moveTo(-w2, -t2)
+          s.lineTo(w2, -t2)
+          s.lineTo(w2, t2)
+          s.lineTo(-w2, t2)
+          s.closePath()
+          return s
+        }
+
+        const makeRibbonAlong = (curve, width, thickness, steps) => {
+          const shape = makeRibbonShape(width, thickness)
+          const geo = new THREE.ExtrudeGeometry(shape, {
+            steps,
+            bevelEnabled: false,
+            extrudePath: curve,
+          })
+          const mesh = new THREE.Mesh(geo, ribbonMat)
+          bowGroup.add(mesh)
+        }
+
+        const makeLoop = (dir) => {
+          const pts = [
+            new THREE.Vector3(0, 0, 0),
+            new THREE.Vector3(0.28 * dir, 0.2, 0.05),
+            new THREE.Vector3(0.92 * dir, 0.26, 0.36),
+            new THREE.Vector3(1.22 * dir, 0.06, 0.0),
+            new THREE.Vector3(0.92 * dir, -0.2, -0.36),
+            new THREE.Vector3(0.28 * dir, -0.12, -0.05),
+            new THREE.Vector3(0, 0, 0),
+          ]
+          const curve = new THREE.CatmullRomCurve3(pts)
+          makeRibbonAlong(curve, 0.34, 0.045, 70)
+        }
+        makeLoop(1)
+        makeLoop(-1)
+
+        const makeTail = (dir) => {
+          const pts = [
+            new THREE.Vector3(0.08 * dir, -0.02, 0.12),
+            new THREE.Vector3(0.28 * dir, -0.42, 0.22),
+            new THREE.Vector3(0.48 * dir, -0.98, 0.12),
+            new THREE.Vector3(0.34 * dir, -1.72, 0.02),
+          ]
+          const curve = new THREE.CatmullRomCurve3(pts)
+          makeRibbonAlong(curve, 0.26, 0.04, 46)
+        }
+        makeTail(1)
+        makeTail(-1)
+
+        group.position.set(0, -7.2, 18)
+        _giftBoxBasePos.copy(group.position)
+        group.scale.setScalar(1.85)
+        group.visible = true
+
+        _introEmitFrom.set(group.position.x, group.position.y + (h * group.scale.y) * 0.88, group.position.z)
+
+        giftBoxInnerLight = new THREE.PointLight(0xffc9ee, 0, 40)
+        giftBoxInnerLight.position.set(0, h * 0.86, 0)
+        group.add(giftBoxInnerLight)
+
+        const glowTex = makeGlowTexture()
+        const glowMat = new THREE.MeshBasicMaterial({
+          map: glowTex,
+          transparent: true,
+          opacity: 0.85,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        })
+        glowMat.toneMapped = false
+        giftBoxMaterials.push(glowMat)
+        giftBoxGlow = new THREE.Mesh(new THREE.PlaneGeometry(18, 18), glowMat)
+        giftBoxGlow.position.set(0, h * 0.9, -d * 0.95)
+        group.add(giftBoxGlow)
+
+        const sparkMat = new THREE.PointsMaterial({
+          map: glowTex,
+          transparent: true,
+          opacity: 1,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          size: 0.26,
+          sizeAttenuation: true,
+          vertexColors: true,
+        })
+        sparkMat.toneMapped = false
+        giftBoxMaterials.push(sparkMat)
+
+        const sparkCount = 220
+        const positions = new Float32Array(sparkCount * 3)
+        const colors = new Float32Array(sparkCount * 3)
+        const angles = new Float32Array(sparkCount)
+        const radii = new Float32Array(sparkCount)
+        const speeds = new Float32Array(sparkCount)
+        const heights = new Float32Array(sparkCount)
+        const rises = new Float32Array(sparkCount)
+        const phases = new Float32Array(sparkCount)
+
+        const gold = new THREE.Color(0xfff1c9)
+        const pink = new THREE.Color(0xff7db7)
+        const white = new THREE.Color(0xffffff)
+        const minR = 3.6
+        const maxR = 6.4
+        const minH = 0.4
+        const maxH = 6.0
+        for (let i = 0; i < sparkCount; i++) {
+          angles[i] = Math.random() * Math.PI * 2
+          radii[i] = minR + Math.random() * (maxR - minR)
+          speeds[i] = 0.85 + Math.random() * 1.55
+          heights[i] = minH + Math.random() * (maxH - minH)
+          rises[i] = 0.35 + Math.random() * 0.75
+          phases[i] = Math.random() * Math.PI * 2
+
+          const mix = Math.random()
+          const c = mix < 0.5 ? gold : mix < 0.82 ? pink : white
+          const f = 0.65 + Math.random() * 0.55
+          colors[i * 3 + 0] = c.r * f
+          colors[i * 3 + 1] = c.g * f
+          colors[i * 3 + 2] = c.b * f
+        }
+
+        const sparkGeo = new THREE.BufferGeometry()
+        sparkGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+        sparkGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+        const sparks = new THREE.Points(sparkGeo, sparkMat)
+        sparks.position.set(0, h * 0.25, 0)
+        group.add(sparks)
+
+        giftSparkleRig = {
+          points: sparks,
+          geometry: sparkGeo,
+          material: sparkMat,
+          count: sparkCount,
+          positions,
+          angles,
+          radii,
+          speeds,
+          heights,
+          rises,
+          phases,
+          minR,
+          maxR,
+          minH,
+          maxH,
+        }
+
+        giftBoxGroup = group
+        mainGroup.add(group)
       }
 
       function createTextures() {
@@ -956,6 +1665,16 @@
             let baseScale = 0.16 + Math.random() * 0.44
             if (Math.random() < 0.012) baseScale *= 1.6 + Math.random() * 0.8
             const spinZ = (Math.random() - 0.5) * 2.2
+            let ex = Math.random() - 0.5
+            let ey = Math.random() - 0.2
+            let ez = Math.random() - 0.5
+            const el = Math.hypot(ex, ey, ez) || 1
+            ex /= el
+            ey /= el
+            ez /= el
+            const emitAmp = 16.0 + Math.random() * 22.0
+            const emitDelay = Math.random() * 0.34
+            const emitPhase = Math.random() * Math.PI * 2
 
             this.items[i] = {
               pos: posTree.clone(),
@@ -964,6 +1683,12 @@
               zRot: Math.random() * Math.PI * 2,
               spinZ,
               baseScale,
+              emitX: ex,
+              emitY: ey,
+              emitZ: ez,
+              emitAmp,
+              emitDelay,
+              emitPhase,
             }
           }
 
@@ -972,25 +1697,50 @@
 
         update(dt, mode) {
           if (!this.mesh) return
+          const intro = STATE.intro
+          const introActive = !!intro && intro.phase !== 'DONE' && intro.emitT > 0
+          const introT = introActive ? intro.emitT : 0
           const h = CONFIG.particles.treeHeight
           const halfH = h / 2
+          const useScatter = !introActive && (mode === 'SCATTER' || mode === 'FOCUS')
           const lerpSpeed = mode === 'FOCUS' ? 2.6 : 2.1
-          const useScatter = mode === 'SCATTER' || mode === 'FOCUS'
           this._baseQuat.copy(mainGroup.quaternion).invert().multiply(camera.quaternion)
 
           for (let i = 0; i < this.count; i++) {
             const it = this.items[i]
             const target = useScatter ? it.posScatter : it.posTree
-            it.pos.lerp(target, lerpSpeed * dt)
+            if (introActive) {
+              const u = clamp01((introT - it.emitDelay * 0.65) / 0.86)
+              const tt = easeInOutCubic(u)
+              const curl = (1 - u) * it.emitAmp
+              const spin =
+                it.emitPhase + (1 - u) * 12.8 + clock.elapsedTime * 0.95 * (1 - u)
+              const s = Math.sin(Math.PI * u)
+              const a = s * curl * 1.55
+              it.pos.set(
+                THREE.MathUtils.lerp(_introEmitFrom.x, it.posTree.x, tt) +
+                  it.emitX * a +
+                  Math.cos(spin) * curl * 0.52 * s,
+                THREE.MathUtils.lerp(_introEmitFrom.y, it.posTree.y, tt) +
+                  it.emitY * a +
+                  (1 - u) * curl * 0.3 * s,
+                THREE.MathUtils.lerp(_introEmitFrom.z, it.posTree.z, tt) +
+                  it.emitZ * a +
+                  Math.sin(spin) * curl * 0.52 * s
+              )
+            } else {
+              it.pos.lerp(target, lerpSpeed * dt)
+            }
 
             if (useScatter) it.zRot += it.spinZ * dt
             else it.zRot += 0.35 * dt
 
             const tn = THREE.MathUtils.clamp((it.pos.y + halfH) / h, 0, 1)
             const glowScale = THREE.MathUtils.lerp(1.35, 0.6, tn)
+            const scaleIn = introActive ? smoothstep(0.0, 0.22, introT - it.emitDelay) : 1
 
             this._tmpPos.copy(it.pos)
-            this._tmpScale.setScalar(it.baseScale * glowScale)
+            this._tmpScale.setScalar(it.baseScale * glowScale * scaleIn)
 
             this._tmpQuat.copy(this._baseQuat)
             this._tmpQuatZ.setFromAxisAngle(this._zAxis, it.zRot)
@@ -1052,6 +1802,16 @@
             const widthOffset = (Math.random() - 0.5) * 0.75
             const baseScale = 0.45 + Math.random() * 0.65
             const spinZ = (Math.random() - 0.5) * 0.9
+            let ex = Math.random() - 0.5
+            let ey = Math.random() - 0.2
+            let ez = Math.random() - 0.5
+            const el = Math.hypot(ex, ey, ez) || 1
+            ex /= el
+            ey /= el
+            ez /= el
+            const emitAmp = 12.0 + Math.random() * 18.0
+            const emitDelay = 0.08 + u * 0.28 + Math.random() * 0.14
+            const emitPhase = Math.random() * Math.PI * 2
 
             const ht = Math.random() * Math.PI * 2
             const hx0 = 16 * Math.pow(Math.sin(ht), 3)
@@ -1080,6 +1840,12 @@
               zRot: Math.random() * Math.PI * 2,
               spinZ,
               baseScale,
+              emitX: ex,
+              emitY: ey,
+              emitZ: ez,
+              emitAmp,
+              emitDelay,
+              emitPhase,
             }
           }
 
@@ -1089,7 +1855,10 @@
         update(dt, mode) {
           if (!this.mesh) return
           const t = clock.elapsedTime
-          const useHeart = mode === 'SCATTER' || mode === 'FOCUS'
+          const intro = STATE.intro
+          const introActive = !!intro && intro.phase !== 'DONE' && intro.emitT > 0
+          const introT = introActive ? intro.emitT : 0
+          const useHeart = !introActive && (mode === 'SCATTER' || mode === 'FOCUS')
           const lerpSpeed = useHeart ? 3.4 : 2.2
           this._baseQuat.copy(mainGroup.quaternion).invert().multiply(camera.quaternion)
 
@@ -1147,7 +1916,28 @@
               this._target.set(Math.cos(a) * r, y, Math.sin(a) * r)
             }
 
-            it.pos.lerp(this._target, lerpSpeed * dt)
+            if (introActive) {
+              const u = clamp01((introT - it.emitDelay * 0.65) / 0.86)
+              const tt = easeInOutCubic(u)
+              const curl = (1 - u) * it.emitAmp
+              const spin =
+                it.emitPhase + (1 - u) * 14.2 + clock.elapsedTime * 0.9 * (1 - u)
+              const s = Math.sin(Math.PI * u)
+              const a = s * curl * 1.52
+              it.pos.set(
+                THREE.MathUtils.lerp(_introEmitFrom.x, this._target.x, tt) +
+                  it.emitX * a +
+                  Math.cos(spin) * curl * 0.48 * s,
+                THREE.MathUtils.lerp(_introEmitFrom.y, this._target.y, tt) +
+                  it.emitY * a +
+                  (1 - u) * curl * 0.34 * s,
+                THREE.MathUtils.lerp(_introEmitFrom.z, this._target.z, tt) +
+                  it.emitZ * a +
+                  Math.sin(spin) * curl * 0.48 * s
+              )
+            } else {
+              it.pos.lerp(this._target, lerpSpeed * dt)
+            }
 
             it.zRot += it.spinZ * dt
 
@@ -1155,9 +1945,10 @@
               ? 1 + 0.05 * Math.sin(t * 2.0 + it.phase)
               : 1 + 0.06 * Math.sin(t * 1.2 + it.phase)
             const scaleBoost = useHeart ? 1.18 : 1.0
+            const scaleIn = introActive ? smoothstep(0.0, 0.22, introT - it.emitDelay) : 1
 
             this._tmpPos.copy(it.pos)
-            this._tmpScale.setScalar(it.baseScale * pulse * scaleBoost)
+            this._tmpScale.setScalar(it.baseScale * pulse * scaleBoost * scaleIn)
 
             this._tmpQuat.copy(this._baseQuat)
             this._tmpQuatZ.setFromAxisAngle(this._zAxis, it.zRot)
@@ -1195,6 +1986,21 @@
             (Math.random() - 0.5) * speedMult,
             (Math.random() - 0.5) * speedMult
           )
+          this._tmpIntro = new THREE.Vector3()
+          {
+            let ex = Math.random() - 0.5
+            let ey = Math.random() - 0.2
+            let ez = Math.random() - 0.5
+            const el = Math.hypot(ex, ey, ez) || 1
+            ex /= el
+            ey /= el
+            ez /= el
+            this.emitDir = new THREE.Vector3(ex, ey, ez)
+          }
+          this.emitPhase = Math.random() * Math.PI * 2
+          const ampBase = type === 'PHOTO' ? 6.2 : isDust ? 8.2 : 9.6
+          this.emitAmp = ampBase * (0.85 + Math.random() * 1.0)
+          this.emitDelay = 0.12
 
           this.calculatePositions()
         }
@@ -1214,6 +2020,10 @@
             t = Math.pow(t, 1.15)
             t = Math.min(t, 0.96)
           }
+          this.emitDelay = Math.min(
+            0.46,
+            0.05 + t * 0.35 + (this.type === 'PHOTO' ? 0.1 : 0) + Math.random() * 0.08
+          )
           const y = t * h - halfH
           let rMax = CONFIG.particles.treeRadius * (1.0 - t)
           if (rMax < 0.5) rMax = 0.5
@@ -1240,10 +2050,14 @@
         }
 
         update(dt, mode, focusTargetMesh) {
+          const intro = STATE.intro
+          const introActive = !!intro && intro.phase !== 'DONE' && intro.emitT > 0
+          const introT = introActive ? intro.emitT : 0
+          const activeMode = introActive ? 'TREE' : mode
           let target = this.posTree
 
-          if (mode === 'SCATTER') target = this.posScatter
-          else if (mode === 'FOCUS') {
+          if (activeMode === 'SCATTER') target = this.posScatter
+          else if (activeMode === 'FOCUS') {
             if (this.mesh === focusTargetMesh) {
               const desiredWorldPos = new THREE.Vector3(0, 2, 35)
               const invMatrix = new THREE.Matrix4()
@@ -1257,15 +2071,35 @@
 
           // Movement Easing
           const lerpSpeed =
-            mode === 'FOCUS' && this.mesh === focusTargetMesh
+            activeMode === 'FOCUS' && this.mesh === focusTargetMesh
               ? 5.0
-              : mode === 'SCATTER' && this.type === 'PHOTO'
+              : activeMode === 'SCATTER' && this.type === 'PHOTO'
                 ? 3.2
                 : 2.0
-          this.mesh.position.lerp(target, lerpSpeed * dt)
+          if (introActive) {
+            const u = clamp01((introT - this.emitDelay * 0.6) / 0.86)
+            const tt = easeInOutCubic(u)
+            const curl = (1 - u) * this.emitAmp
+            const spin =
+              this.emitPhase + (1 - u) * 15.5 + clock.elapsedTime * 0.9 * (1 - u)
+            const s = Math.sin(Math.PI * u)
+            const a = s * curl * 1.55
+            this._tmpIntro.set(
+              THREE.MathUtils.lerp(_introEmitFrom.x, this.posTree.x, tt) +
+                Math.cos(spin) * curl * 0.48 * s,
+              THREE.MathUtils.lerp(_introEmitFrom.y, this.posTree.y, tt) +
+                (1 - u) * curl * 0.38 * s,
+              THREE.MathUtils.lerp(_introEmitFrom.z, this.posTree.z, tt) +
+                Math.sin(spin) * curl * 0.48 * s
+            )
+            this._tmpIntro.addScaledVector(this.emitDir, a * 1.1)
+            this.mesh.position.copy(this._tmpIntro)
+          } else {
+            this.mesh.position.lerp(target, lerpSpeed * dt)
+          }
 
           // Rotation Logic - CRITICAL: Ensure spin happens in Scatter
-          if (mode === 'SCATTER') {
+          if (activeMode === 'SCATTER') {
             if (this.type === 'PHOTO') {
               this.mesh.lookAt(camera.position)
             } else {
@@ -1273,7 +2107,7 @@
               this.mesh.rotation.y += this.spinSpeed.y * dt
               this.mesh.rotation.z += this.spinSpeed.z * dt // Added Z for more natural tumble
             }
-          } else if (mode === 'TREE') {
+          } else if (activeMode === 'TREE') {
             if (this.type === 'PHOTO') {
               const px = this.mesh.position.x
               const pz = this.mesh.position.z
@@ -1313,7 +2147,7 @@
             }
           }
 
-          if (mode === 'FOCUS' && this.mesh === focusTargetMesh) {
+          if (activeMode === 'FOCUS' && this.mesh === focusTargetMesh) {
             this.mesh.lookAt(camera.position)
           }
 
@@ -1323,17 +2157,22 @@
             s =
               this.baseScale *
               (0.8 + 0.4 * Math.sin(clock.elapsedTime * 4 + this.mesh.id))
-            if (mode === 'TREE') s = 0
-          } else if (mode === 'SCATTER' && this.type === 'PHOTO') {
+            if (activeMode === 'TREE' && !introActive) s = 0
+          } else if (activeMode === 'SCATTER' && this.type === 'PHOTO') {
             // Large preview size in scatter
             s = this.baseScale * 2.5
-          } else if (mode === 'FOCUS') {
+          } else if (activeMode === 'FOCUS') {
             if (this.mesh === focusTargetMesh) s = 4.5
             else if (this.type === 'PHOTO') s = this.baseScale * 2.5
             else s = this.baseScale
           }
 
-          this.mesh.scale.lerp(new THREE.Vector3(s, s, s), 4 * dt)
+          if (introActive) {
+            const scaleIn = smoothstep(0.0, 0.22, introT - this.emitDelay)
+            this.mesh.scale.setScalar(s * scaleIn)
+          } else {
+            this.mesh.scale.lerp(new THREE.Vector3(s, s, s), 4 * dt)
+          }
         }
       }
 
@@ -1496,6 +2335,13 @@
 
       function updateStar(dt, mode) {
         if (!starRig) return
+        if (STATE.intro && STATE.intro.phase !== 'DONE') {
+          if (STATE.intro.emitT < 0.88) {
+            starRig.group.visible = false
+            return
+          }
+          starRig.group.visible = true
+        }
         const useScatter = mode === 'SCATTER' || mode === 'FOCUS'
         const targetMorph = useScatter ? 1 : 0
         starRig.morph += (targetMorph - starRig.morph) * 2.8 * dt
@@ -1596,7 +2442,7 @@
         }
       }
 
-      function addPhotoToScene(texture) {
+      function addPhotoToScene(texture, opts = null) {
         const img = texture?.image ?? texture?.source?.data
         const iw = img?.naturalWidth ?? img?.videoWidth ?? img?.width ?? 0
         const ih = img?.naturalHeight ?? img?.videoHeight ?? img?.height ?? 0
@@ -1609,12 +2455,7 @@
         const border = 0.11
         const frameDepth = 0.06
         const frameGeo = new THREE.BoxGeometry(photoW + border * 2, photoH + border * 2, frameDepth)
-        const frameMat = new THREE.MeshStandardMaterial({
-          color: 0xf7f6f2,
-          metalness: 0.0,
-          roughness: 1.0,
-          envMapIntensity: 0.12,
-        })
+        const frameMat = new THREE.MeshBasicMaterial({ color: 0xffffff })
         frameMat.toneMapped = false
         const frame = new THREE.Mesh(frameGeo, frameMat)
 
@@ -1627,6 +2468,10 @@
         const group = new THREE.Group()
         group.add(frame)
         group.add(photo)
+        if (opts && typeof opts === 'object') {
+          if (typeof opts.photoId === 'number') group.userData.photoId = opts.photoId
+          if (typeof opts.objectUrl === 'string') group.userData.objectUrl = opts.objectUrl
+        }
 
         const s = 0.8
         group.scale.set(s, s, s)
@@ -1634,21 +2479,23 @@
         photoMeshGroup.add(group)
         particleSystem.push(new Particle(group, 'PHOTO', false))
         relayoutScatterPhotos()
+        if (STATE.intro && STATE.intro.phase !== 'DONE') group.visible = false
       }
 
-      function handleImageUpload(e) {
+      async function handleImageUpload(e) {
         const files = e.target.files
         if (!files.length) return
-        Array.from(files).forEach((f) => {
-          const reader = new FileReader()
-          reader.onload = (ev) => {
-            new THREE.TextureLoader().load(ev.target.result, (t) => {
-              t.colorSpace = THREE.SRGBColorSpace
-              addPhotoToScene(t)
-            })
-          }
-          reader.readAsDataURL(f)
-        })
+        const list = Array.from(files)
+        e.target.value = ''
+        for (const f of list) {
+          try {
+            const id = await savePhotoBlob(f)
+            const url = URL.createObjectURL(f)
+            const t = await loadTextureFromUrl(url)
+            t.colorSpace = THREE.SRGBColorSpace
+            addPhotoToScene(t, { photoId: id, objectUrl: url })
+          } catch {}
+        }
       }
 
       // --- MEDIAPIPE ---
@@ -2024,6 +2871,13 @@
             if (STATE.uiHidden) return
             if (isUiTarget(e.target)) return
             if (STATE.drag.active || STATE.drag.tapActive) return
+            if (STATE.intro && STATE.intro.phase !== 'DONE') {
+              if (STATE.intro.phase === 'BOX' && pickGiftBoxAt(e.clientX, e.clientY)) {
+                startIntroOpen()
+              }
+              e.preventDefault()
+              return
+            }
 
             closeSettings()
             if (photoManager && !photoManager.classList.contains('hidden')) return
@@ -2063,6 +2917,7 @@
         canvas.addEventListener(
           'pointermove',
           (e) => {
+            if (STATE.intro && STATE.intro.phase !== 'DONE') return
             if (STATE.drag.pointerId !== e.pointerId) return
             if (!STATE.drag.active && !STATE.drag.tapActive) return
 
@@ -2115,6 +2970,7 @@
         )
 
         const endDrag = (e) => {
+          if (STATE.intro && STATE.intro.phase !== 'DONE') return
           if (STATE.drag.pointerId !== e.pointerId) return
           const wasActive = STATE.drag.active
           const wasTap = STATE.drag.tapActive
@@ -2215,18 +3071,20 @@
         document.querySelectorAll('.delete-btn').forEach(btn => {
           btn.addEventListener('click', function() {
             const index = parseInt(this.getAttribute('data-index'))
-            deletePhoto(index)
+            void deletePhoto(index)
           })
         })
       }
 
       // 删除照片
-      function deletePhoto(index) {
+      async function deletePhoto(index) {
         // 获取所有照片粒子
         const photoParticles = particleSystem.filter(p => p.type === 'PHOTO')
         
         if (index >= 0 && index < photoParticles.length) {
           const particleToDelete = photoParticles[index]
+          const storedId = particleToDelete?.mesh?.userData?.photoId
+          const storedUrl = particleToDelete?.mesh?.userData?.objectUrl
           
           // 从场景中移除网格
           if (particleToDelete.mesh && particleToDelete.mesh.parent) {
@@ -2243,6 +3101,17 @@
           if (photoMeshGroup && particleToDelete.mesh) {
             photoMeshGroup.remove(particleToDelete.mesh)
           }
+
+          if (typeof storedId === 'number') {
+            try {
+              await deletePhotoBlob(storedId)
+            } catch {}
+          }
+          if (typeof storedUrl === 'string') {
+            try {
+              URL.revokeObjectURL(storedUrl)
+            } catch {}
+          }
           
           // 更新照片网格
           updatePhotoGrid()
@@ -2253,53 +3122,61 @@
       function animate() {
         requestAnimationFrame(animate)
         const dt = clock.getDelta()
+        updateIntro(dt)
+        const introActive = STATE.intro && STATE.intro.phase !== 'DONE'
+        const mode = introActive ? 'TREE' : STATE.mode
 
         // Rotation Logic
-        const nowMs = performance.now()
-        const handActive = STATE.hand.detected || nowMs - STATE.hand.lastSeenMs < 260
-        const hasInertia =
-          Math.abs(STATE.drag.vx) + Math.abs(STATE.drag.vy) > 0.0008
-        const dragActive = STATE.drag.active || hasInertia
+        if (introActive) {
+          STATE.rotation.x = 0
+          STATE.rotation.y = 0
+        } else {
+          const nowMs = performance.now()
+          const handActive = STATE.hand.detected || nowMs - STATE.hand.lastSeenMs < 260
+          const hasInertia =
+            Math.abs(STATE.drag.vx) + Math.abs(STATE.drag.vy) > 0.0008
+          const dragActive = STATE.drag.active || hasInertia
 
-        if (handActive) {
-          STATE.drag.vx = 0
-          STATE.drag.vy = 0
-          const sens = getGestureSensitivityConfig()
-          const rotStrength = (STATE.mode === 'TREE' ? 2.6 : 2.4) * sens.rot
-          const hx = THREE.MathUtils.clamp(STATE.hand.x, -1, 1)
-          const hy = THREE.MathUtils.clamp(STATE.hand.y, -1, 1)
-          const targetRotY = hx * Math.PI * rotStrength
-          const targetRotX =
-            STATE.mode === 'TREE'
-              ? 0
-              : STATE.mode === 'SCATTER'
-                ? hy * Math.PI * (0.25 * rotStrength)
-                : STATE.rotation.x
-          STATE.rotation.y += (targetRotY - STATE.rotation.y) * (3.0 * sens.follow) * dt
-          const xFollow = (STATE.mode === 'TREE' ? 5.5 : 3.0) * sens.follow
-          STATE.rotation.x += (targetRotX - STATE.rotation.x) * xFollow * dt
-        } else if (dragActive) {
-          if (!STATE.drag.active) {
-            STATE.rotation.y += STATE.drag.vy * dt
-            STATE.drag.vy *= Math.exp(-7.5 * dt)
-            if (STATE.mode !== 'TREE') {
-              STATE.rotation.x += STATE.drag.vx * dt
-              STATE.drag.vx *= Math.exp(-7.5 * dt)
-              const maxX = Math.PI * 0.45
-              STATE.rotation.x = THREE.MathUtils.clamp(STATE.rotation.x, -maxX, maxX)
+          if (handActive) {
+            STATE.drag.vx = 0
+            STATE.drag.vy = 0
+            const sens = getGestureSensitivityConfig()
+            const rotStrength = (STATE.mode === 'TREE' ? 2.6 : 2.4) * sens.rot
+            const hx = THREE.MathUtils.clamp(STATE.hand.x, -1, 1)
+            const hy = THREE.MathUtils.clamp(STATE.hand.y, -1, 1)
+            const targetRotY = hx * Math.PI * rotStrength
+            const targetRotX =
+              STATE.mode === 'TREE'
+                ? 0
+                : STATE.mode === 'SCATTER'
+                  ? hy * Math.PI * (0.25 * rotStrength)
+                  : STATE.rotation.x
+            STATE.rotation.y += (targetRotY - STATE.rotation.y) * (3.0 * sens.follow) * dt
+            const xFollow = (STATE.mode === 'TREE' ? 5.5 : 3.0) * sens.follow
+            STATE.rotation.x += (targetRotX - STATE.rotation.x) * xFollow * dt
+          } else if (dragActive) {
+            if (!STATE.drag.active) {
+              STATE.rotation.y += STATE.drag.vy * dt
+              STATE.drag.vy *= Math.exp(-7.5 * dt)
+              if (STATE.mode !== 'TREE') {
+                STATE.rotation.x += STATE.drag.vx * dt
+                STATE.drag.vx *= Math.exp(-7.5 * dt)
+                const maxX = Math.PI * 0.45
+                STATE.rotation.x = THREE.MathUtils.clamp(STATE.rotation.x, -maxX, maxX)
+              } else {
+                STATE.rotation.x += (0 - STATE.rotation.x) * 3.0 * dt
+                STATE.drag.vx = 0
+              }
             } else {
-              STATE.rotation.x += (0 - STATE.rotation.x) * 3.0 * dt
-              STATE.drag.vx = 0
+              if (STATE.mode === 'TREE') STATE.rotation.x = 0
             }
           } else {
-            if (STATE.mode === 'TREE') STATE.rotation.x = 0
-          }
-        } else {
-          if (STATE.mode === 'TREE') {
-            STATE.rotation.y += 0.0375 * dt
-            STATE.rotation.x += (0 - STATE.rotation.x) * 2.0 * dt
-          } else {
-            STATE.rotation.y += 0.0125 * dt
+            if (STATE.mode === 'TREE') {
+              STATE.rotation.y += 0.0375 * dt
+              STATE.rotation.x += (0 - STATE.rotation.x) * 2.0 * dt
+            } else {
+              STATE.rotation.y += 0.0125 * dt
+            }
           }
         }
 
@@ -2307,16 +3184,20 @@
         mainGroup.rotation.x = STATE.rotation.x
 
         if (occluder) {
-          occluder.visible = STATE.mode === 'TREE'
-          occluder.quaternion.copy(camera.quaternion)
+          const intro = STATE.intro
+          const inTreeMode = STATE.mode === 'TREE'
+          const introActive = intro && intro.phase !== 'DONE'
+          const showDuringIntro = introActive && (intro.emitT || 0) > 0.4
+          occluder.visible = inTreeMode && (!introActive || showDuringIntro)
+          if (occluder.visible) occluder.quaternion.copy(camera.quaternion)
         }
 
-        if (snowflakeSystem) snowflakeSystem.update(dt, STATE.mode)
-        if (ribbonSystem) ribbonSystem.update(dt, STATE.mode)
-        updateStar(dt, STATE.mode)
+        if (snowflakeSystem) snowflakeSystem.update(dt, mode)
+        if (ribbonSystem) ribbonSystem.update(dt, mode)
+        updateStar(dt, mode)
 
         particleSystem.forEach((p) =>
-          p.update(dt, STATE.mode, STATE.focusTarget)
+          p.update(dt, mode, STATE.focusTarget)
         )
         composer.render()
       }
