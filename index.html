@@ -707,7 +707,7 @@
         if (vp.portrait) {
           fov = vp.compact ? 56 : 52
           camY = 1.8
-          camZ = mode === 'SCATTER' ? (vp.compact ? 75 : 70) : vp.compact ? 63 : 60
+          camZ = mode === 'SCATTER' ? (vp.compact ? 69 : 64) : vp.compact ? 62 : 58
           if (vp.compact) camZ += 1
         }
 
@@ -2496,8 +2496,12 @@
         const photoGeo = new THREE.PlaneGeometry(photoW, photoH)
         const photoMat = new THREE.MeshBasicMaterial({ map: texture, color: 0xe2e2e2 })
         photoMat.toneMapped = false
+        photoMat.polygonOffset = true
+        photoMat.polygonOffsetFactor = -2
+        photoMat.polygonOffsetUnits = -2
         const photo = new THREE.Mesh(photoGeo, photoMat)
         photo.position.z = frameDepth / 2 + 0.002
+        photo.renderOrder = 1
 
         const group = new THREE.Group()
         group.add(frame)
